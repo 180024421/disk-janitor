@@ -1,0 +1,8 @@
+{
+  "versionCode": 3,
+  "versionName": "0.2.1",
+  "desktopUrl": "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-0.2.1.exe",
+  "changelog": "jiaoben app-update + UI refresh",
+  "displayName": "Disk Janitor",
+  "enabled": true
+}
