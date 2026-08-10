@@ -29,25 +29,37 @@ set "VER=%VER: =%"
 set "VER=%VER:"=%"
 
 set "CODE="
-for /f "tokens=2 delims==" %%c in ('findstr /C:"APP_VERSION_CODE:" src\updater.rs') do (
-  set "CODE=%%c"
-  goto :have_code
+for /f "tokens=1-3 delims=." %%a in ("%VER%") do (
+  set /a CODE=%%a*10000+%%b*100+%%c
 )
-:have_code
-set "CODE=%CODE: =%"
-set "CODE=%CODE:;=%"
-if "%CODE%"=="" set "CODE=1"
+if "%CODE%"=="" set "CODE=500"
+echo [版本] %VER% → versionCode=%CODE%
 
 if not exist "release" mkdir "release"
 if not exist "deploy" mkdir "deploy"
 copy /Y "target\release\disk-janitor.exe" "release\DiskJanitor-%VER%.exe" >nul
 copy /Y "target\release\disk-janitor.exe" "release\disk-janitor.exe" >nul
 
+set "SHA="
+where certutil >nul 2>&1
+if not errorlevel 1 (
+  for /f "skip=1 tokens=*" %%h in ('certutil -hashfile "release\DiskJanitor-%VER%.exe" SHA256 ^| findstr /R /V ":"') do (
+    if not defined SHA set "SHA=%%h"
+  )
+)
+set "SHA=%SHA: =%"
+set "SHA=%SHA:"=%"
+
 > "deploy\app-update.json" (
   echo {
   echo   "versionCode": %CODE%,
   echo   "versionName": "%VER%",
   echo   "desktopUrl": "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-%VER%.exe",
+  if defined SHA (
+    echo   "sha256": "%SHA%",
+  ) else (
+    echo   "sha256": "",
+  )
   echo   "changelog": "disk-janitor %VER% #%CODE%",
   echo   "displayName": "Disk Janitor",
   echo   "enabled": true
@@ -57,7 +69,7 @@ copy /Y "deploy\app-update.json" "release\app-update.json" >nul
 
 echo.
 echo [完成] release\DiskJanitor-%VER%.exe
-echo        deploy\app-update.json  ^(versionCode=%CODE%^)
+echo        deploy\app-update.json  ^(versionCode=%CODE% sha256=%SHA%^)
 echo        上传 exe 后把 app-update 写到 jiaoben / 静态目录
 echo.
 dir /b "release\*.exe"

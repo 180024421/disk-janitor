@@ -1,8 +1,9 @@
 {
-  "versionCode": 3,
-  "versionName": "0.2.1",
-  "desktopUrl": "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-0.2.1.exe",
-  "changelog": "jiaoben app-update + UI refresh",
+  "versionCode": 500,
+  "versionName": "0.5.0",
+  "desktopUrl": "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-0.5.0.exe",
+  "sha256": "",
+  "changelog": "0.5.0: safe clean, resume scan, whitelist, path actions, dup keep strategy",
   "displayName": "Disk Janitor",
   "enabled": true
 }

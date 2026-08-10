@@ -22,6 +22,10 @@ pub struct ScanIndex {
     /// 父路径(小写) -> 子条目 key 列表（避免每次 O(全表) 找子项）
     pub children: HashMap<String, Vec<String>>,
     pub skipped: u64,
+    /// 因跳过深入扫描而估算计入的字节（node_modules 等）
+    pub skipped_bytes: u64,
+    /// 跳过说明（供 UI 提示）
+    pub skipped_notes: Vec<String>,
     pub file_count: u64,
     pub dir_count: u64,
     pub errors: Vec<String>,
@@ -45,13 +49,18 @@ impl ScanIndex {
     }
 
     pub fn get(&self, path: &Path) -> Option<&FsEntry> {
-        self.entries.get(&Self::key(path))
+        self.entries.get(&Self::key(path)).or_else(|| {
+            let want = Self::key_norm(path);
+            self.entries
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&want))
+                .map(|(_, v)| v)
+        })
     }
 
     /// 重建父子索引（扫盘结束 / 增量快照后调用）
     pub fn rebuild_children(&mut self) {
         self.children.clear();
-        // 预估容量，减少 rehash
         self.children.reserve(self.entries.len() / 4 + 16);
         for (key, e) in &self.entries {
             let Some(parent) = e.path.parent() else {
@@ -66,7 +75,6 @@ impl ScanIndex {
         }
     }
 
-    /// 列出某一目录下的直接子项（O(子项数)，不是 O(全盘)）
     pub fn children_of(&self, dir: &Path) -> Vec<&FsEntry> {
         let parent = Self::key_norm(dir);
         let Some(keys) = self.children.get(&parent) else {
@@ -77,7 +85,6 @@ impl ScanIndex {
             .collect()
     }
 
-    /// 仅子目录（侧边树）；可按大小截断
     pub fn child_dirs_of(&self, dir: &Path) -> Vec<&FsEntry> {
         self.children_of(dir)
             .into_iter()
@@ -105,7 +112,6 @@ impl ScanIndex {
         v
     }
 
-    /// 空目录（占用为 0 的文件夹），按路径排序后截断
     pub fn empty_dirs(&self, n: usize) -> Vec<&FsEntry> {
         let mut v: Vec<&FsEntry> = self
             .entries
@@ -120,21 +126,29 @@ impl ScanIndex {
     /// 删除路径及其子孙，并从祖先目录扣减占用
     pub fn remove_cascade(&mut self, path: &Path) {
         let key = Self::key(path);
-        let size = self.entries.get(&key).map(|e| e.size).unwrap_or(0);
-        let prefix = if key.ends_with('\\') {
-            key.clone()
+        let key_l = key.to_ascii_lowercase();
+        let size = self
+            .entries
+            .get(&key)
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                    .map(|(_, v)| v)
+            })
+            .map(|e| e.size)
+            .unwrap_or(0);
+        let prefix = if key_l.ends_with('\\') {
+            key_l.clone()
         } else {
-            format!("{}\\", key)
+            format!("{}\\", key_l)
         };
         let doomed: Vec<String> = self
             .entries
             .keys()
             .filter(|k| {
-                let kk = k.as_str();
-                kk.eq_ignore_ascii_case(&key)
-                    || kk
-                        .to_ascii_lowercase()
-                        .starts_with(&prefix.to_ascii_lowercase())
+                let kk = k.to_ascii_lowercase();
+                kk == key_l || kk.starts_with(&prefix)
             })
             .cloned()
             .collect();
@@ -153,6 +167,14 @@ impl ScanIndex {
             }
             let ak = Self::key(anc);
             if let Some(e) = self.entries.get_mut(&ak) {
+                if e.is_dir {
+                    e.size = e.size.saturating_sub(size);
+                }
+            } else if let Some((_, e)) = self
+                .entries
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&ak))
+            {
                 if e.is_dir {
                     e.size = e.size.saturating_sub(size);
                 }
@@ -213,21 +235,52 @@ pub fn format_mtime(t: Option<SystemTime>) -> String {
     let Some(t) = t else {
         return "—".into();
     };
-    let Ok(dur) = t.duration_since(SystemTime::UNIX_EPOCH) else {
-        return "—".into();
-    };
-    let secs = dur.as_secs() as i64;
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "—".into())
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+pub fn format_delta(delta: i64) -> String {
+    if delta >= 0 {
+        format!("+{}", format_bytes(delta as u64))
+    } else {
+        format!("-{}", format_bytes((-delta) as u64))
+    }
 }
 
 pub fn list_drives() -> Vec<PathBuf> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
     let mut drives = Vec::new();
-    for c in b'A'..=b'Z' {
-        let p = PathBuf::from(format!("{}:\\", c as char));
-        if p.exists() {
-            drives.push(p);
+    for i in 0..26u8 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let letter = (b'A' + i) as char;
+        let mut root = [
+            u16::from(letter as u8),
+            u16::from(b':'),
+            u16::from(b'\\'),
+            0,
+        ];
+        let dtype = unsafe { GetDriveTypeW(root.as_mut_ptr()) };
+        // 2 removable, 3 fixed, 4 remote, 6 ram — 跳过空光驱(5 且可能无介质)
+        if dtype == 2 || dtype == 3 || dtype == 4 || dtype == 6 {
+            drives.push(PathBuf::from(format!("{letter}:\\")));
+        } else if dtype == 5 {
+            // 光驱有介质时偶尔可用，不主动 exists 探测以免卡住
+        }
+    }
+    if drives.is_empty() {
+        // 兜底
+        for c in b'C'..=b'Z' {
+            let p = PathBuf::from(format!("{}:\\", c as char));
+            if p.exists() {
+                drives.push(p);
+            }
         }
     }
     drives

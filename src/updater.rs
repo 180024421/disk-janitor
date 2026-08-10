@@ -1,13 +1,13 @@
-//! 远程更新：对齐 DeskReader / jiaoben app-update，本机自动下载热替换
+//! 远程更新：对齐 DeskReader / jiaoben app-update，本机自动下载热替换 + SHA256 校验
 
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const APP_VERSION_NAME: &str = env!("CARGO_PKG_VERSION");
-/// 发版时与 versionName 同步递增（整数比较优先）
-pub const APP_VERSION_CODE: u32 = 3;
+include!(concat!(env!("OUT_DIR"), "/version_code.rs"));
 pub const APP_KEY: &str = "disk-janitor";
 pub const DEFAULT_API_BASE: &str = "http://111.229.202.251:8687";
 
@@ -17,6 +17,7 @@ pub struct RemoteManifest {
     pub version_name: String,
     pub url: String,
     pub changelog: String,
+    pub sha256: String,
 }
 
 impl RemoteManifest {
@@ -39,11 +40,21 @@ pub enum UpdateCheck {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
-    /// jiaoben / 静态根地址，如 http://111.229.202.251:8687
     #[serde(default = "default_api_base", alias = "update_url")]
     pub update_api_base: String,
     #[serde(default = "default_true")]
     pub check_on_start: bool,
+    /// UI 缩放（1.0 / 1.15 / 1.3）
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    /// 上次扫描根路径（便于继续扫）
+    #[serde(default)]
+    pub last_scan_root: String,
+    /// 上次扫描摘要一行
+    #[serde(default)]
+    pub last_scan_summary: String,
+    #[serde(default)]
+    pub dup_keep_strategy: crate::duplicates::KeepStrategy,
 }
 
 fn default_api_base() -> String {
@@ -54,11 +65,19 @@ fn default_true() -> bool {
     true
 }
 
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             update_api_base: DEFAULT_API_BASE.to_string(),
             check_on_start: true,
+            ui_scale: 1.0,
+            last_scan_root: String::new(),
+            last_scan_summary: String::new(),
+            dup_keep_strategy: crate::duplicates::KeepStrategy::PreferNotDownloads,
         }
     }
 }
@@ -82,8 +101,12 @@ impl AppConfig {
         cfg
     }
 
-    /// 旧配置可能把完整 latest.json URL 写进 update_url / update_api_base
     pub fn normalize(&mut self) {
+        if !self.ui_scale.is_finite() {
+            self.ui_scale = 1.0;
+        } else {
+            self.ui_scale = self.ui_scale.clamp(0.85, 2.0);
+        }
         let mut base = self.update_api_base.trim().to_string();
         if base.is_empty() || base.contains("YOUR_SERVER") {
             self.update_api_base = DEFAULT_API_BASE.to_string();
@@ -233,6 +256,14 @@ fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
+    let sha256 = v
+        .get("sha256")
+        .or_else(|| v.get("sha256sum"))
+        .or_else(|| v.get("hash"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if version_code == 0 && version_name.is_empty() && url.is_empty() {
         return None;
     }
@@ -241,6 +272,7 @@ fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
         version_name,
         url,
         changelog,
+        sha256,
     })
 }
 
@@ -248,6 +280,9 @@ fn score_update(m: &RemoteManifest) -> i64 {
     let mut s = i64::from(m.version_code) * 1000;
     if !m.url.is_empty() {
         s += 30;
+    }
+    if !m.sha256.is_empty() {
+        s += 20;
     }
     if !m.changelog.is_empty() && !m.changelog.contains("初始占位") {
         s += 5;
@@ -267,7 +302,6 @@ pub fn need_update(remote: &RemoteManifest) -> bool {
     false
 }
 
-/// a > b → 1；相等 → 0；a < b → -1
 pub fn compare_version_name(a: &str, b: &str) -> i32 {
     let parse = |s: &str| -> Vec<u64> {
         s.trim()
@@ -307,7 +341,21 @@ pub fn open_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 下载到 exe 同目录的 disk-janitor.new.exe，并启动替换脚本
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// 下载到 exe 同目录的 disk-janitor.new.exe，校验 SHA256（若清单提供），并启动替换脚本
 pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
     if manifest.url.trim().is_empty() {
         return Err("远程未提供 desktopUrl".into());
@@ -329,6 +377,17 @@ pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
     std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
     file.flush().map_err(|e| e.to_string())?;
     drop(file);
+
+    if !manifest.sha256.is_empty() {
+        let got = sha256_file(&new_path)?;
+        let expect = manifest.sha256.trim().to_ascii_lowercase();
+        if got != expect {
+            let _ = fs::remove_file(&new_path);
+            return Err(format!(
+                "SHA256 校验失败：期望 {expect}，实际 {got}。已删除损坏文件。"
+            ));
+        }
+    }
 
     let exe_name = exe
         .file_name()
@@ -355,9 +414,15 @@ pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
 
+    let verify = if manifest.sha256.is_empty() {
+        "（清单未提供 sha256，已跳过校验）"
+    } else {
+        "（SHA256 已校验）"
+    };
     Ok(format!(
-        "已下载 {}，即将重启替换。请保存工作后关闭本窗口。",
-        manifest.label()
+        "已下载 {} {}，即将重启替换。请保存工作后关闭本窗口。",
+        manifest.label(),
+        verify
     ))
 }
 
@@ -381,6 +446,7 @@ mod tests {
             version_name: APP_VERSION_NAME.to_string(),
             url: "http://x/a.exe".into(),
             changelog: String::new(),
+            sha256: String::new(),
         };
         assert!(need_update(&by_code));
 
@@ -389,18 +455,20 @@ mod tests {
             version_name: APP_VERSION_NAME.to_string(),
             url: "http://x/a.exe".into(),
             changelog: String::new(),
+            sha256: String::new(),
         };
         assert!(!need_update(&same));
     }
 
     #[test]
     fn parses_jiaoben_style_manifest() {
-        let j = r#"{"versionCode":5,"versionName":"0.3.0","desktopUrl":"http://x/a.exe","changelog":"fix"}"#;
+        let j = r#"{"versionCode":5,"versionName":"0.3.0","desktopUrl":"http://x/a.exe","changelog":"fix","sha256":"abc"}"#;
         let v: serde_json::Value = serde_json::from_str(j).unwrap();
         let m = parse_update_payload(&v).unwrap();
         assert_eq!(m.version_code, 5);
         assert_eq!(m.version_name, "0.3.0");
         assert_eq!(m.url, "http://x/a.exe");
+        assert_eq!(m.sha256, "abc");
     }
 
     #[test]
@@ -426,6 +494,7 @@ mod tests {
         let mut c = AppConfig {
             update_api_base: "http://h:8687/disk-janitor/latest.json".into(),
             check_on_start: true,
+            ..Default::default()
         };
         c.normalize();
         assert_eq!(c.update_api_base, "http://h:8687");

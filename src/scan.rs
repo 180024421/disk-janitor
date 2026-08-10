@@ -1,6 +1,6 @@
-//! 并行扫盘引擎（支持增量快照）
+//! 并行扫盘引擎（支持增量快照；跳过目录可估算占用）
 
-use crate::model::{FsEntry, ScanIndex};
+use crate::model::{format_bytes, FsEntry, ScanIndex};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,16 +27,23 @@ struct Raw {
     is_dir: bool,
     file_size: u64,
     mtime: Option<SystemTime>,
+    /// 不展开子树时的强制目录占用
+    forced_dir_size: Option<u64>,
 }
 
 pub enum ScanEvent {
     Progress(ScanProgress),
-    /// 边扫边更新的不完整索引
     Partial(ScanIndex),
     Done(ScanIndex),
 }
 
-/// 扫描 `root`。通过 `on_event` 推送进度与增量索引。
+enum SkipKind {
+    /// 完全忽略（回收站等）
+    Ignore,
+    /// 估算占用后记为目录条目，不进栈
+    CountOnly,
+}
+
 pub fn scan_path<F>(root: PathBuf, cancel: Arc<AtomicBool>, mut on_event: F) -> ScanIndex
 where
     F: FnMut(ScanEvent),
@@ -45,11 +52,13 @@ where
     let visited = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
     let bytes_seen = Arc::new(AtomicU64::new(0));
+    let skipped_bytes = Arc::new(AtomicU64::new(0));
 
     let mut index = ScanIndex {
         root: root.clone(),
         ..Default::default()
     };
+    let mut skipped_notes: Vec<String> = Vec::new();
 
     if !root.exists() {
         let msg = format!("路径不存在: {}", root.display());
@@ -73,13 +82,13 @@ where
     let mut last_ui = Instant::now();
     let mut last_partial = Instant::now();
 
-    // 先塞入根，并快速列出第一层，立刻给 UI
     if let Ok(meta) = std::fs::metadata(&root) {
         raws.push(Raw {
             path: root.clone(),
             is_dir: meta.is_dir(),
             file_size: if meta.is_dir() { 0 } else { meta.len() },
             mtime: meta.modified().ok(),
+            forced_dir_size: None,
         });
     }
     if let Ok(rd) = std::fs::read_dir(&root) {
@@ -103,19 +112,36 @@ where
                     is_dir,
                     file_size,
                     mtime: meta.modified().ok(),
+                    forced_dir_size: None,
                 });
             }
         }
-        // 根已展开，从 stack 去掉 root 本身（若存在）
         stack.retain(|p| p != &root);
-        let snap = finish_counts(build_index(index.clone(), &raws, &root, 0, true));
+        let snap = finish_counts(build_index(
+            index.clone(),
+            &raws,
+            &root,
+            0,
+            0,
+            &[],
+            true,
+        ));
         on_event(ScanEvent::Partial(snap));
     }
 
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
             let skipped_n = skipped.load(Ordering::Relaxed);
-            let done = finish_counts(build_index(index, &raws, &root, skipped_n, false));
+            let sb = skipped_bytes.load(Ordering::Relaxed);
+            let done = finish_counts(build_index(
+                index,
+                &raws,
+                &root,
+                skipped_n,
+                sb,
+                &skipped_notes,
+                true, // 取消时标记为未完整扫描
+            ));
             on_event(ScanEvent::Progress(ScanProgress {
                 visited: visited.load(Ordering::Relaxed),
                 skipped: skipped_n,
@@ -163,15 +189,29 @@ where
                         is_dir: false,
                         file_size: meta.len(),
                         mtime: meta.modified().ok(),
+                        forced_dir_size: None,
                     });
                 }
-                // 跳过会拖死扫描的系统/缓存目录（仍计 skipped，不进栈）
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if should_skip_dir(name) {
+                if let Some(kind) = should_skip_dir(name) {
                     skipped.fetch_add(1, Ordering::Relaxed);
-                    return None;
+                    match kind {
+                        SkipKind::Ignore => return None,
+                        SkipKind::CountOnly => {
+                            let (sz, _) = quick_dir_size(path, cancel.as_ref(), 80_000);
+                            skipped_bytes.fetch_add(sz, Ordering::Relaxed);
+                            bytes_seen.fetch_add(sz, Ordering::Relaxed);
+                            visited.fetch_add(1, Ordering::Relaxed);
+                            return Some(Raw {
+                                path: path.clone(),
+                                is_dir: true,
+                                file_size: 0,
+                                mtime: meta.modified().ok(),
+                                forced_dir_size: Some(sz),
+                            });
+                        }
+                    }
                 }
-                // 跳过联接/重解析点（OneDrive 等），避免扫用户目录时卡死
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::MetadataExt;
@@ -192,12 +232,21 @@ where
                     is_dir,
                     file_size,
                     mtime: meta.modified().ok(),
+                    forced_dir_size: None,
                 })
             })
             .collect();
 
         for r in &chunk {
-            if r.is_dir {
+            if let Some(sz) = r.forced_dir_size {
+                if skipped_notes.len() < 30 {
+                    skipped_notes.push(format!(
+                        "{} ≈ {}（未展开）",
+                        r.path.display(),
+                        format_bytes(sz)
+                    ));
+                }
+            } else if r.is_dir {
                 stack.push(r.path.clone());
             }
         }
@@ -217,7 +266,6 @@ where
             }));
         }
 
-        // 增量索引：首层已推过；之后最多每 3s 一次，且条目过大时停推，避免 UI 卡死
         let n = raws.len();
         let interval = if n > 80_000 {
             Duration::from_secs(10)
@@ -229,6 +277,7 @@ where
         if n <= 120_000 && last_partial.elapsed() >= interval {
             last_partial = Instant::now();
             let skipped_n = skipped.load(Ordering::Relaxed);
+            let sb = skipped_bytes.load(Ordering::Relaxed);
             let snap = finish_counts(build_index(
                 ScanIndex {
                     root: root.clone(),
@@ -238,6 +287,8 @@ where
                 &raws,
                 &root,
                 skipped_n,
+                sb,
+                &skipped_notes,
                 true,
             ));
             on_event(ScanEvent::Partial(snap));
@@ -245,7 +296,17 @@ where
     }
 
     let skipped_n = skipped.load(Ordering::Relaxed);
-    let done = finish_counts(build_index(index, &raws, &root, skipped_n, false));
+    let sb = skipped_bytes.load(Ordering::Relaxed);
+    let cancelled = cancel.load(Ordering::Relaxed);
+    let done = finish_counts(build_index(
+        index,
+        &raws,
+        &root,
+        skipped_n,
+        sb,
+        &skipped_notes,
+        cancelled,
+    ));
     on_event(ScanEvent::Progress(ScanProgress {
         visited: visited.load(Ordering::Relaxed),
         skipped: skipped_n,
@@ -253,7 +314,7 @@ where
         current: root.display().to_string(),
         elapsed: started.elapsed(),
         done: true,
-        cancelled: cancel.load(Ordering::Relaxed),
+        cancelled,
         error: None,
     }));
     on_event(ScanEvent::Done(done.clone()));
@@ -267,22 +328,23 @@ fn finish_counts(mut index: ScanIndex) -> ScanIndex {
     index
 }
 
-fn should_skip_dir(name: &str) -> bool {
+fn should_skip_dir(name: &str) -> Option<SkipKind> {
     let lower = name.to_ascii_lowercase();
-    lower == "$recycle.bin"
-        || lower == "system volume information"
-        || lower == "winsxs"
-        || lower == "installer"
-        || lower == "servicing"
-        || lower == "softwaredistribution"
-        || lower == "package cache"
-        || lower == "node_modules"
-        || lower == ".git"
-        || lower == ".svn"
-        || lower == "csc"
-        || lower == "onedrive"
-        || lower == "onedrivetemp"
-        || lower.starts_with("onedrive")
+    match lower.as_str() {
+        "$recycle.bin" | "system volume information" | "csc" => Some(SkipKind::Ignore),
+        "winsxs"
+        | "installer"
+        | "servicing"
+        | "softwaredistribution"
+        | "package cache"
+        | "node_modules"
+        | ".git"
+        | ".svn"
+        | "onedrive"
+        | "onedrivetemp" => Some(SkipKind::CountOnly),
+        _ if lower.starts_with("onedrive") => Some(SkipKind::CountOnly),
+        _ => None,
+    }
 }
 
 fn build_index(
@@ -290,9 +352,13 @@ fn build_index(
     raws: &[Raw],
     root: &Path,
     skipped: u64,
+    skipped_bytes: u64,
+    skipped_notes: &[String],
     partial: bool,
 ) -> ScanIndex {
     index.skipped = skipped;
+    index.skipped_bytes = skipped_bytes;
+    index.skipped_notes = skipped_notes.to_vec();
     index.partial = partial;
     let mut entries: HashMap<String, FsEntry> = HashMap::new();
     let mut dir_sizes: HashMap<String, u64> = HashMap::new();
@@ -305,7 +371,7 @@ fn build_index(
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| r.path.display().to_string());
         entries.insert(
-            key,
+            key.clone(),
             FsEntry {
                 path: r.path.clone(),
                 name,
@@ -314,7 +380,17 @@ fn build_index(
                 mtime: r.mtime,
             },
         );
-        if !r.is_dir && r.file_size > 0 {
+        let add = if let Some(fs) = r.forced_dir_size {
+            fs
+        } else if !r.is_dir && r.file_size > 0 {
+            r.file_size
+        } else {
+            0
+        };
+        if add > 0 {
+            if r.forced_dir_size.is_some() {
+                *dir_sizes.entry(key).or_insert(0) += add;
+            }
             for anc in r.path.ancestors().skip(1) {
                 if anc.as_os_str().is_empty() {
                     break;
@@ -323,7 +399,7 @@ fn build_index(
                     continue;
                 }
                 let k = ScanIndex::key(anc);
-                *dir_sizes.entry(k).or_insert(0) += r.file_size;
+                *dir_sizes.entry(k).or_insert(0) += add;
             }
         }
     }
@@ -338,7 +414,6 @@ fn build_index(
     index
 }
 
-/// 快速估算目录占用（垃圾规则用，可取消）
 pub fn quick_dir_size(path: &Path, cancel: &AtomicBool, max_files: u64) -> (u64, u64) {
     let mut total = 0u64;
     let mut files = 0u64;
@@ -397,24 +472,15 @@ mod tests {
     }
 
     #[test]
-    fn sorts_children_and_filter_keys() {
+    fn counts_skipped_node_modules() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("big.bin"), vec![1u8; 3000]).unwrap();
-        fs::write(dir.path().join("small.bin"), vec![1u8; 10]).unwrap();
-        fs::create_dir(dir.path().join("subdir")).unwrap();
-        fs::write(dir.path().join("subdir").join("x"), vec![1u8; 100]).unwrap();
-
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("pkg.js"), vec![1u8; 2000]).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let idx = scan_path(dir.path().to_path_buf(), cancel, |_| {});
-        let mut kids = idx.children_of(dir.path());
-        crate::model::sort_entries(
-            &mut kids,
-            crate::model::SortKey::Size,
-            crate::model::SortDir::Desc,
-        );
-        assert!(kids[0].is_dir);
-        let files: Vec<_> = kids.iter().filter(|e| !e.is_dir).collect();
-        assert!(files[0].size >= files[1].size);
+        assert!(idx.skipped_bytes >= 2000 || idx.get(&nm).map(|e| e.size).unwrap_or(0) >= 2000);
+        assert_eq!(idx.get(dir.path()).unwrap().size, 2000);
     }
 
     #[test]
