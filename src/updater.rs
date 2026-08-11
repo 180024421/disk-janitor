@@ -55,6 +55,33 @@ pub struct AppConfig {
     pub last_scan_summary: String,
     #[serde(default)]
     pub dup_keep_strategy: crate::duplicates::KeepStrategy,
+    /// 查重最小文件体积（MB）
+    #[serde(default = "default_dup_min_mb")]
+    pub dup_min_mb: u64,
+    /// 查重最多返回组数
+    #[serde(default = "default_dup_max_groups")]
+    pub dup_max_groups: usize,
+    /// 启动后安静清理安全垃圾（仅一次）
+    #[serde(default)]
+    pub quiet_clean_on_start: bool,
+    /// 浏览页显示 Treemap
+    #[serde(default = "default_true")]
+    pub show_treemap: bool,
+    /// 扫描排除路径（前缀匹配）
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    /// "normal" | "turbo"
+    #[serde(default = "default_scan_mode")]
+    pub scan_mode: String,
+    /// 是否启用每日安静清理计划任务
+    #[serde(default)]
+    pub schedule_quiet_clean: bool,
+    /// 计划任务时间 HH:MM
+    #[serde(default = "default_schedule_time")]
+    pub schedule_time: String,
+    /// 删除确认默认勾选安全粉碎
+    #[serde(default)]
+    pub shred_default: bool,
 }
 
 fn default_api_base() -> String {
@@ -69,6 +96,22 @@ fn default_ui_scale() -> f32 {
     1.0
 }
 
+fn default_dup_min_mb() -> u64 {
+    1
+}
+
+fn default_dup_max_groups() -> usize {
+    80
+}
+
+fn default_scan_mode() -> String {
+    "normal".into()
+}
+
+fn default_schedule_time() -> String {
+    "03:00".into()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -78,6 +121,15 @@ impl Default for AppConfig {
             last_scan_root: String::new(),
             last_scan_summary: String::new(),
             dup_keep_strategy: crate::duplicates::KeepStrategy::PreferNotDownloads,
+            dup_min_mb: 1,
+            dup_max_groups: 80,
+            quiet_clean_on_start: false,
+            show_treemap: true,
+            exclude_paths: Vec::new(),
+            scan_mode: "normal".into(),
+            schedule_quiet_clean: false,
+            schedule_time: "03:00".into(),
+            shred_default: false,
         }
     }
 }
@@ -106,6 +158,21 @@ impl AppConfig {
             self.ui_scale = 1.0;
         } else {
             self.ui_scale = self.ui_scale.clamp(0.85, 2.0);
+        }
+        if self.dup_min_mb == 0 {
+            self.dup_min_mb = 1;
+        }
+        if self.dup_max_groups == 0 {
+            self.dup_max_groups = 80;
+        }
+        let mode = self.scan_mode.trim().to_ascii_lowercase();
+        self.scan_mode = if mode == "turbo" {
+            "turbo".into()
+        } else {
+            "normal".into()
+        };
+        if self.schedule_time.trim().is_empty() {
+            self.schedule_time = "03:00".into();
         }
         let mut base = self.update_api_base.trim().to_string();
         if base.is_empty() || base.contains("YOUR_SERVER") {

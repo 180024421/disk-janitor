@@ -1,6 +1,9 @@
 /target/
 /release/*.exe
+/release/pack/
+/release/resources/
 /release/latest.json
+/installer/payload.zip
 *.pdb
 .idea/
 .vscode/

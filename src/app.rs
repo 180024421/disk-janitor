@@ -1,16 +1,24 @@
-//! 主界面 v0.5.0：安全清理 / 续扫记忆 / 白名单 / 路径快捷操作 / 查重保留策略
+//! 主界面 v0.7.0：排除列表 / 极速扫描 / 深度卸载 / 计划任务 / 安全粉碎
 
+use crate::about::{self, AboutAssets, AboutPanel};
 use crate::admin::{is_elevated, relaunch_as_admin};
+use crate::checkpoint::ScanCheckpoint;
+use crate::deep_uninstall::{
+    install_paths_of, list_appx_packages, list_locking_processes, list_related_services,
+    list_related_tasks, tokens_from_name, uninstall_appx, AppxPackage, LockingProcess,
+    RelatedService, RelatedTask,
+};
 use crate::drives::{list_drive_infos, DriveInfo};
 use crate::duplicates::{apply_keep_strategy, find_duplicates, DupGroup, KeepStrategy};
 use crate::export::{
     compare_with_snapshot, default_export_dir, export_csv, export_json, load_snapshot, save_snapshot,
     DiffItem,
 };
+use crate::fast_scan;
 use crate::file_types::{filter_files, FileKind};
 use crate::junk::{
-    apply_safe_selection, junk_selected_paths, reclaimable_estimate, safe_selected_size, scan_junk,
-    JunkHit,
+    apply_safe_selection, junk_selected_paths, reclaimable_estimate, safe_junk_hits,
+    safe_selected_size, scan_junk, JunkHit,
 };
 use crate::leftovers::{
     scan_leftovers, scan_leftovers_for_app, AppLeftoverHint, Confidence, LeftoverHit,
@@ -22,7 +30,9 @@ use crate::model::{
     SortKey,
 };
 use crate::orphans::{delete_orphan_keys, scan_orphan_uninstall_keys, OrphanReg};
-use crate::scan::{scan_path, ScanEvent, ScanProgress};
+use crate::scan::{expand_count_only_dir, resume_scan, scan_path_ex, ScanEvent, ScanOptions, ScanProgress};
+use crate::schedule;
+use crate::treemap;
 use crate::shortcuts::{scan_broken_shortcuts, BrokenShortcut};
 use crate::software::{launch_uninstall, list_installed_apps, InstalledApp};
 use crate::startup::{
@@ -60,6 +70,7 @@ enum Tab {
     Duplicates,
     Tools,
     Settings,
+    About,
 }
 
 enum WorkerMsg {
@@ -77,6 +88,9 @@ enum WorkerMsg {
     UpdateApplied(Result<String, String>),
     DuplicatesDone(Vec<DupGroup>),
     LeftoversDone(Vec<LeftoverHit>),
+    DeepLockDone(Vec<LockingProcess>),
+    DeepSvcDone(Vec<RelatedService>, Vec<RelatedTask>),
+    AppxDone(Vec<AppxPackage>),
 }
 
 pub struct JanitorApp {
@@ -151,6 +165,27 @@ pub struct JanitorApp {
     show_recycle_hint: bool,
     awaiting_uninstall_done: Option<AppLeftoverHint>,
     scan_paused_root: Option<String>,
+    about_panel: AboutPanel,
+    about_assets: Option<AboutAssets>,
+    about_tip: String,
+    expand_scanning: Option<PathBuf>,
+    quiet_clean_started: bool,
+    /// 多盘勾选（根路径字符串）
+    selected_drives: HashSet<String>,
+    /// 排队扫描的盘根
+    drive_scan_queue: VecDeque<PathBuf>,
+    /// 当前扫描是否极速
+    scan_use_turbo: bool,
+    exclude_edit: String,
+    shred_delete: bool,
+    locking_procs: Vec<LockingProcess>,
+    related_services: Vec<RelatedService>,
+    related_tasks: Vec<RelatedTask>,
+    appx_packages: Vec<AppxPackage>,
+    deep_loading: bool,
+    appx_loading: bool,
+    appx_filter: String,
+    schedule_status: String,
 }
 
 impl Default for JanitorApp {
@@ -168,7 +203,7 @@ impl Default for JanitorApp {
             sort_dir: SortDir::Desc,
             filter: String::new(),
             selected: HashSet::new(),
-            status: "欢迎使用磁盘管家。可从「总览」选盘扫描，或用工具清理残留。删除默认进回收站。"
+            status: "欢迎使用大帅清理器。可从「总览」选盘扫描，或用工具清理残留。删除默认进回收站。"
                 .into(),
             scanning: false,
             progress: None,
@@ -229,6 +264,24 @@ impl Default for JanitorApp {
             show_recycle_hint: false,
             awaiting_uninstall_done: None,
             scan_paused_root: None,
+            about_panel: AboutPanel::About,
+            about_assets: None,
+            about_tip: String::new(),
+            expand_scanning: None,
+            quiet_clean_started: false,
+            selected_drives: HashSet::new(),
+            drive_scan_queue: VecDeque::new(),
+            scan_use_turbo: false,
+            exclude_edit: String::new(),
+            shred_delete: false,
+            locking_procs: Vec::new(),
+            related_services: Vec::new(),
+            related_tasks: Vec::new(),
+            appx_packages: Vec::new(),
+            deep_loading: false,
+            appx_loading: false,
+            appx_filter: String::new(),
+            schedule_status: String::new(),
         }
     }
 }
@@ -240,14 +293,25 @@ fn dirs_fallback() -> PathBuf {
 }
 
 impl JanitorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, open_path: Option<PathBuf>) -> Self {
         theme::apply_theme(&cc.egui_ctx);
         install_cjk_fonts(&cc.egui_ctx);
         let mut app = Self::default();
+        app.exclude_edit = app.config.exclude_paths.join("\n");
+        app.scan_use_turbo = app.config.scan_mode.eq_ignore_ascii_case("turbo");
+        app.shred_delete = app.config.shred_default;
+        if schedule::task_installed() {
+            app.schedule_status = "计划任务已安装（DiskJanitorQuietClean）".into();
+            app.config.schedule_quiet_clean = true;
+        }
         cc.egui_ctx
             .set_pixels_per_point(app.config.ui_scale.clamp(0.85, 2.0));
         let default_root = dirs_fallback().display().to_string();
-        if !app.config.last_scan_root.trim().is_empty() && app.root_input == default_root {
+        if let Some(p) = open_path {
+            app.root_input = p.display().to_string();
+            app.current_dir = p;
+            app.status = format!("已从命令行打开路径：{}", app.root_input);
+        } else if !app.config.last_scan_root.trim().is_empty() && app.root_input == default_root {
             app.root_input = app.config.last_scan_root.clone();
             app.scan_paused_root = Some(app.config.last_scan_root.clone());
         }
@@ -260,6 +324,7 @@ impl JanitorApp {
     /// 扫描/清理等互斥；更新检查独立，不计入 busy
     fn busy(&self) -> bool {
         self.scanning
+            || self.expand_scanning.is_some()
             || self.junk_scanning
             || self.junk_cleaning
             || self.deleting
@@ -269,9 +334,25 @@ impl JanitorApp {
             || self.orphans_scanning
             || self.dup_scanning
             || self.leftovers_scanning
+            || self.deep_loading
+            || self.appx_loading
+    }
+
+    fn scan_excludes(&self) -> Vec<PathBuf> {
+        self.config
+            .exclude_paths
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect()
     }
 
     fn start_scan(&mut self) {
+        self.start_scan_with_opts(self.config.scan_mode == "turbo");
+    }
+
+    fn start_scan_with_opts(&mut self, turbo: bool) {
         if self.busy() {
             return;
         }
@@ -285,15 +366,22 @@ impl JanitorApp {
         self.cancel = Some(cancel.clone());
         self.rx = Some(rx);
         self.scanning = true;
+        self.scan_use_turbo = turbo;
         self.selected.clear();
         self.last_error.clear();
         self.tree_expanded.insert(ScanIndex::key(&root));
-        self.status = format!("正在扫描 {} …（可边扫边浏览）", root.display());
+        let mode = if turbo { "极速" } else { "普通" };
+        self.status = format!("正在{mode}扫描 {} …（可边扫边浏览）", root.display());
         self.current_dir = root.clone();
         self.tab = Tab::Browse;
+        let excludes = self.scan_excludes();
+        let opts = ScanOptions {
+            excludes: excludes.clone(),
+            turbo,
+        };
 
         let handle = std::thread::spawn(move || {
-            let _idx = scan_path(root, cancel, |ev| match ev {
+            let send = |ev: ScanEvent| match ev {
                 ScanEvent::Progress(p) => {
                     let _ = tx.send(WorkerMsg::Progress(p));
                 }
@@ -303,9 +391,55 @@ impl JanitorApp {
                 ScanEvent::Done(i) => {
                     let _ = tx.send(WorkerMsg::Done(i));
                 }
-            });
+            };
+            if turbo {
+                let _ = fast_scan::try_fast_scan(root, cancel, &excludes, send);
+            } else {
+                let _ = scan_path_ex(root, cancel, send, opts);
+            }
         });
         self._worker = Some(handle);
+    }
+
+    fn start_queued_drive_scans(&mut self, roots: Vec<PathBuf>, turbo: bool) {
+        if roots.is_empty() || self.busy() {
+            return;
+        }
+        let mut iter = roots.into_iter();
+        let Some(first) = iter.next() else {
+            return;
+        };
+        self.drive_scan_queue = iter.collect();
+        self.scan_use_turbo = turbo;
+        self.root_input = first.display().to_string();
+        let remaining = self.drive_scan_queue.len();
+        self.status = if remaining > 0 {
+            format!(
+                "多盘排队：先扫 {}，其后还有 {} 个",
+                first.display(),
+                remaining
+            )
+        } else {
+            format!("开始扫描 {}", first.display())
+        };
+        self.start_scan_with_opts(turbo);
+    }
+
+    fn maybe_continue_drive_queue(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if let Some(next) = self.drive_scan_queue.pop_front() {
+            self.root_input = next.display().to_string();
+            let left = self.drive_scan_queue.len();
+            self.status = format!(
+                "多盘排队继续：{}（剩余 {}）",
+                next.display(),
+                left
+            );
+            let turbo = self.scan_use_turbo;
+            self.start_scan_with_opts(turbo);
+        }
     }
 
     fn start_junk_scan(&mut self) {
@@ -342,6 +476,58 @@ impl JanitorApp {
         self._worker = Some(handle);
     }
 
+    fn start_appx_list(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.appx_loading = true;
+        self.status = "正在读取 Store/AppX…".into();
+        let handle = std::thread::spawn(move || {
+            let pkgs = list_appx_packages();
+            let _ = tx.send(WorkerMsg::AppxDone(pkgs));
+        });
+        self._worker = Some(handle);
+    }
+
+    fn start_deep_lock_check(&mut self, app: &InstalledApp) {
+        if self.busy() {
+            return;
+        }
+        let paths = install_paths_of(&app.install_location);
+        if paths.is_empty() {
+            self.status = "该软件无安装路径，无法查占用进程".into();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.deep_loading = true;
+        self.status = format!("正在查占用：{} …", app.display_name);
+        let handle = std::thread::spawn(move || {
+            let procs = list_locking_processes(&paths);
+            let _ = tx.send(WorkerMsg::DeepLockDone(procs));
+        });
+        self._worker = Some(handle);
+    }
+
+    fn start_deep_svc_check(&mut self, app: &InstalledApp) {
+        if self.busy() {
+            return;
+        }
+        let tokens = tokens_from_name(&app.display_name);
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.deep_loading = true;
+        self.status = format!("正在查服务/任务：{} …", app.display_name);
+        let handle = std::thread::spawn(move || {
+            let svcs = list_related_services(&tokens);
+            let tasks = list_related_tasks(&tokens);
+            let _ = tx.send(WorkerMsg::DeepSvcDone(svcs, tasks));
+        });
+        self._worker = Some(handle);
+    }
+
     fn start_startup_scan(&mut self) {
         if self.busy() {
             return;
@@ -368,7 +554,7 @@ impl JanitorApp {
         self.rx = Some(rx);
         self.shortcuts_scanning = true;
         self.shortcut_scan_started = Some(Instant::now());
-        self.status = "正在扫描桌面失效快捷方式（最多约 3 秒）…".into();
+        self.status = "正在扫描失效快捷方式（桌面 + 开始菜单，最多约 6 秒）…".into();
         self.tab = Tab::Shortcuts;
         let handle = std::thread::spawn(move || {
             let hits = std::panic::catch_unwind(|| scan_broken_shortcuts(&cancel)).unwrap_or_default();
@@ -406,11 +592,14 @@ impl JanitorApp {
         self.cancel = Some(cancel.clone());
         self.rx = Some(rx);
         self.dup_scanning = true;
-        self.status = "正在查找重复文件（≥1MB，最多 80 组）…".into();
+        let min_mb = self.config.dup_min_mb.max(1);
+        let max_groups = self.config.dup_max_groups.max(1);
+        self.status = format!("正在查找重复文件（≥{min_mb}MB，最多 {max_groups} 组）…");
         self.tab = Tab::Duplicates;
         let strategy = self.config.dup_keep_strategy;
+        let min_bytes = min_mb.saturating_mul(1024 * 1024);
         let handle = std::thread::spawn(move || {
-            let groups = find_duplicates(&idx.entries, 1024 * 1024, &cancel, 80, strategy);
+            let groups = find_duplicates(&idx.entries, min_bytes, &cancel, max_groups, strategy);
             let _ = tx.send(WorkerMsg::DuplicatesDone(groups));
         });
         self._worker = Some(handle);
@@ -447,7 +636,7 @@ impl JanitorApp {
         self.leftovers_is_followup = true;
         self.pending_followup = Some(hint.clone());
         self.status = format!("正在跟扫「{}」可能残留…", hint.display_name);
-        self.tab = Tab::Tools;
+        self.tab = Tab::Software;
         let handle = std::thread::spawn(move || {
             let hits = scan_leftovers_for_app(&hint, &cancel);
             let _ = tx.send(WorkerMsg::LeftoversDone(hits));
@@ -531,8 +720,125 @@ impl JanitorApp {
             self.status = "没有可续扫的路径".into();
             return;
         };
-        self.root_input = root;
+        self.root_input = root.clone();
+
+        if let Some(cp) = ScanCheckpoint::load() {
+            let same_root = cp.root.eq_ignore_ascii_case(root.trim());
+            if same_root && !cp.remaining.is_empty() {
+                let base = self
+                    .index
+                    .clone()
+                    .or_else(ScanCheckpoint::load_index);
+                if let Some(base) = base {
+                    let remaining: Vec<PathBuf> =
+                        cp.remaining.iter().map(PathBuf::from).collect();
+                    self.index = Some(base.clone());
+                    self.start_resume_scan(PathBuf::from(root), base, remaining);
+                    return;
+                }
+            }
+        }
         self.start_scan();
+    }
+
+    fn start_resume_scan(&mut self, root: PathBuf, base: ScanIndex, remaining: Vec<PathBuf>) {
+        if self.busy() {
+            return;
+        }
+        if remaining.is_empty() {
+            self.start_scan();
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        self.cancel = Some(cancel.clone());
+        self.rx = Some(rx);
+        self.scanning = true;
+        self.selected.clear();
+        self.last_error.clear();
+        self.tree_expanded.insert(ScanIndex::key(&root));
+        self.status = format!(
+            "正在续扫 {}（剩余 {} 个目录）…",
+            root.display(),
+            remaining.len()
+        );
+        self.current_dir = root.clone();
+        self.tab = Tab::Browse;
+
+        let handle = std::thread::spawn(move || {
+            let _idx = resume_scan(root, base, remaining, cancel, |ev| match ev {
+                ScanEvent::Progress(p) => {
+                    let _ = tx.send(WorkerMsg::Progress(p));
+                }
+                ScanEvent::Partial(i) => {
+                    let _ = tx.send(WorkerMsg::Partial(i));
+                }
+                ScanEvent::Done(i) => {
+                    let _ = tx.send(WorkerMsg::Done(i));
+                }
+            });
+        });
+        self._worker = Some(handle);
+    }
+
+    fn start_expand_count_only(&mut self, dir: PathBuf) {
+        if self.busy() {
+            return;
+        }
+        let Some(base) = self.index.clone() else {
+            self.status = "请先扫描".into();
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        self.cancel = Some(cancel.clone());
+        self.rx = Some(rx);
+        self.scanning = true;
+        self.expand_scanning = Some(dir.clone());
+        self.status = format!("正在深入展开 {} …", dir.display());
+        self.tab = Tab::Browse;
+        let handle = std::thread::spawn(move || {
+            let _idx = expand_count_only_dir(base, dir, cancel, |ev| match ev {
+                ScanEvent::Progress(p) => {
+                    let _ = tx.send(WorkerMsg::Progress(p));
+                }
+                ScanEvent::Partial(i) => {
+                    let _ = tx.send(WorkerMsg::Partial(i));
+                }
+                ScanEvent::Done(i) => {
+                    let _ = tx.send(WorkerMsg::Done(i));
+                }
+            });
+        });
+        self._worker = Some(handle);
+    }
+
+    fn maybe_quiet_clean_on_start(&mut self) {
+        if self.quiet_clean_started || !self.config.quiet_clean_on_start {
+            return;
+        }
+        if self.busy() {
+            // 等空闲后再清，不要把「已尝试」锁死
+            return;
+        }
+        self.quiet_clean_started = true;
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        self.junk_cleaning = true;
+        self.status = "启动时安静清理安全垃圾…".into();
+        let handle = std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let hits = scan_junk(&cancel);
+            let safe = safe_junk_hits(hits);
+            let paths = junk_selected_paths(&safe);
+            let res = if paths.is_empty() {
+                TrashResult::default()
+            } else {
+                clean_junk_paths(&paths)
+            };
+            let _ = tx.send(WorkerMsg::JunkCleanDone(res));
+        });
+        self._worker = Some(handle);
     }
 
     fn refresh_drives(&mut self) {
@@ -596,6 +902,7 @@ impl JanitorApp {
                 WorkerMsg::Progress(_) | WorkerMsg::Partial(_) => {}
                 WorkerMsg::Done(idx) => {
                     self.scanning = false;
+                    let was_expand = self.expand_scanning.take();
                     let cancelled = idx.partial
                         || self
                             .progress
@@ -612,7 +919,32 @@ impl JanitorApp {
                         .as_ref()
                         .map(|p| p.elapsed.as_secs_f32())
                         .unwrap_or(0.0);
-                    let mut status = if cancelled {
+                    let visited = self
+                        .progress
+                        .as_ref()
+                        .map(|p| p.visited)
+                        .unwrap_or(n as u64);
+                    let bytes_seen = self
+                        .progress
+                        .as_ref()
+                        .map(|p| p.bytes_seen)
+                        .unwrap_or(total);
+                    let mut status = if was_expand.is_some() {
+                        if cancelled {
+                            format!(
+                                "展开已取消（部分结果）：{} 项 · {}",
+                                n,
+                                format_bytes(total)
+                            )
+                        } else {
+                            format!(
+                                "已展开目录：{} 项，合计 {}（{:.1}s）",
+                                n,
+                                format_bytes(total),
+                                secs
+                            )
+                        }
+                    } else if cancelled {
                         format!(
                             "已取消扫描（部分结果）：{} 项，合计 {}（{:.1}s）· 可续扫",
                             n,
@@ -644,6 +976,28 @@ impl JanitorApp {
                             idx.skipped_notes.iter().take(5).cloned().collect::<Vec<_>>().join("；")
                         ));
                     }
+                    if was_expand.is_none() {
+                        if cancelled && !idx.resume_stack.is_empty() {
+                            let cp = ScanCheckpoint::from_cancel(
+                                &root,
+                                &idx.resume_stack,
+                                &idx,
+                                visited,
+                                skipped,
+                                bytes_seen,
+                            );
+                            if let Err(e) = cp.save_with_index(&idx) {
+                                self.push_log(format!("断点保存失败：{e}"));
+                            } else {
+                                self.push_log(format!(
+                                    "已保存断点：剩余 {} 个目录（重启后仍可续扫）",
+                                    cp.remaining.len()
+                                ));
+                            }
+                        } else if !cancelled {
+                            ScanCheckpoint::clear();
+                        }
+                    }
                     self.config.last_scan_root = idx.root.display().to_string();
                     self.scan_paused_root = Some(self.config.last_scan_root.clone());
                     self.config.last_scan_summary = if cancelled {
@@ -662,10 +1016,21 @@ impl JanitorApp {
                         )
                     };
                     let _ = self.config.save();
-                    self.current_dir = root;
+                    if let Some(ref exp) = was_expand {
+                        if idx.get(exp).is_some() {
+                            self.current_dir = exp.clone();
+                        } else {
+                            self.current_dir = root;
+                        }
+                    } else {
+                        self.current_dir = root;
+                    }
                     self.index = Some(idx);
                     self.progress = None;
                     self.rx = None;
+                    if was_expand.is_none() && !cancelled {
+                        self.maybe_continue_drive_queue();
+                    }
                 }
                 WorkerMsg::JunkDone(hits) => {
                     self.junk_scanning = false;
@@ -707,7 +1072,7 @@ impl JanitorApp {
                 WorkerMsg::ShortcutsDone(hits) => {
                     self.shortcuts_scanning = false;
                     self.shortcut_scan_started = None;
-                    self.status = format!("失效快捷方式：{} 个（仅桌面）", hits.len());
+                    self.status = format!("失效快捷方式：{} 个（桌面 + 开始菜单）", hits.len());
                     self.broken_shortcuts = hits;
                     self.rx = None;
                 }
@@ -758,8 +1123,33 @@ impl JanitorApp {
                         // 跟扫已完成，清掉「待跟扫」以免重复提示
                         self.pending_followup = None;
                         self.awaiting_uninstall_done = None;
+                        self.tab = Tab::Software;
+                    } else {
+                        self.tab = Tab::Tools;
                     }
-                    self.tab = Tab::Tools;
+                    self.rx = None;
+                }
+                WorkerMsg::DeepLockDone(procs) => {
+                    self.deep_loading = false;
+                    self.locking_procs = procs;
+                    self.status = format!("占用进程：{} 个", self.locking_procs.len());
+                    self.rx = None;
+                }
+                WorkerMsg::DeepSvcDone(svcs, tasks) => {
+                    self.deep_loading = false;
+                    self.related_services = svcs;
+                    self.related_tasks = tasks;
+                    self.status = format!(
+                        "相关服务 {} · 计划任务 {}",
+                        self.related_services.len(),
+                        self.related_tasks.len()
+                    );
+                    self.rx = None;
+                }
+                WorkerMsg::AppxDone(pkgs) => {
+                    self.appx_loading = false;
+                    self.appx_packages = pkgs;
+                    self.status = format!("Store/AppX 应用：{} 个", self.appx_packages.len());
                     self.rx = None;
                 }
                 WorkerMsg::UpdateDone(r) => {
@@ -896,13 +1286,16 @@ impl JanitorApp {
         self.confirm_delete = false;
         self.confirm_sensitive = false;
         let allow = self.allow_permanent_delete;
+        let shred = self.shred_delete;
         self.deleting = true;
         self.last_error.clear();
         self.status = format!("正在删除 {} 项…（大文件可能需一点时间）", paths.len());
         self.push_log(format!(
             "开始删除 {} 项{}",
             paths.len(),
-            if allow {
+            if shred {
+                "（安全粉碎）"
+            } else if allow {
                 "（允许回收站失败时直接删除）"
             } else {
                 ""
@@ -917,7 +1310,13 @@ impl JanitorApp {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let handle = std::thread::spawn(move || {
-            let res = move_to_trash_with(&paths, DeleteOptions { allow_permanent: allow });
+            let res = move_to_trash_with(
+                &paths,
+                DeleteOptions {
+                    allow_permanent: allow || shred,
+                    shred,
+                },
+            );
             let _ = tx.send(WorkerMsg::DeleteDone(res));
         });
         self._worker = Some(handle);
@@ -1150,7 +1549,10 @@ impl JanitorApp {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let handle = std::thread::spawn(move || {
-            let res = move_to_trash_with(&paths, DeleteOptions { allow_permanent: allow });
+            let res = move_to_trash_with(&paths, DeleteOptions {
+                    allow_permanent: allow,
+                    shred: false,
+                });
             let _ = tx.send(WorkerMsg::DeleteDone(res));
         });
         self._worker = Some(handle);
@@ -1173,7 +1575,10 @@ impl JanitorApp {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let handle = std::thread::spawn(move || {
-            let res = move_to_trash_with(&paths, DeleteOptions { allow_permanent: allow });
+            let res = move_to_trash_with(&paths, DeleteOptions {
+                    allow_permanent: allow,
+                    shred: false,
+                });
             let _ = tx.send(WorkerMsg::DeleteDone(res));
         });
         self._worker = Some(handle);
@@ -1353,6 +1758,10 @@ fn draw_tree(ui: &mut egui::Ui, app: &mut JanitorApp, dir: PathBuf, depth: u32) 
 
 impl eframe::App for JanitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.about_assets.is_none() {
+            self.about_assets = Some(AboutAssets::load(ctx));
+        }
+        self.maybe_quiet_clean_on_start();
         self.poll_worker();
         if self.shortcuts_scanning {
             let timed_out = self
@@ -1399,6 +1808,16 @@ impl eframe::App for JanitorApp {
                 if self.leftovers_scanning {
                     self.leftovers_scanning = false;
                 }
+                if self.deep_loading {
+                    self.deep_loading = false;
+                }
+                if self.appx_loading {
+                    self.appx_loading = false;
+                }
+                if self.expand_scanning.is_some() {
+                    self.expand_scanning = None;
+                    self.scanning = false;
+                }
             }
         }
         if let Some(h) = &self.update_worker {
@@ -1425,7 +1844,7 @@ impl eframe::App for JanitorApp {
                                 .strong(),
                         );
                         ui.label(
-                            egui::RichText::new("磁盘管家")
+                            egui::RichText::new("大帅清理器")
                                 .color(ACCENT)
                                 .strong()
                                 .size(22.0),
@@ -1456,6 +1875,7 @@ impl eframe::App for JanitorApp {
                         (Tab::Duplicates, "重复文件"),
                         (Tab::Tools, "工具"),
                         (Tab::Settings, "设置"),
+                        (Tab::About, "关于"),
                     ] {
                         let selected = self.tab == tab;
                         if theme::tab_label(ui, selected, label).clicked() {
@@ -1717,12 +2137,16 @@ impl eframe::App for JanitorApp {
                         self.confirm_dup_delete = true;
                     }
                 }
-                if self.tab == Tab::Tools {
+                if self.tab == Tab::Tools || (self.tab == Tab::Software && self.leftovers_is_followup)
+                {
                     let n = self.leftovers.iter().filter(|h| h.selected).count();
                     if n > 0 {
                         ui.label(format!("勾选 {n} 个残留"));
                         if ui
-                            .add_enabled(!self.deleting && !self.leftovers_scanning, egui::Button::new("删除勾选残留"))
+                            .add_enabled(
+                                !self.deleting && !self.leftovers_scanning,
+                                egui::Button::new("删除勾选残留"),
+                            )
                             .clicked()
                         {
                             self.confirm_leftovers = true;
@@ -1766,6 +2190,7 @@ impl eframe::App for JanitorApp {
             Tab::Duplicates => self.ui_duplicates(ctx),
             Tab::Tools => self.ui_tools(ctx),
             Tab::Settings => self.ui_settings(ctx),
+            Tab::About => self.ui_about(ctx),
         }
 
         self.ui_dialogs(ctx);
@@ -1863,7 +2288,7 @@ impl JanitorApp {
                     });
                 });
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.add(theme::accent_button("刷新盘符")).clicked() {
                         self.refresh_drives();
                     }
@@ -1871,6 +2296,28 @@ impl JanitorApp {
                         egui::RichText::new(format!("共 {} 个可用卷", self.drive_infos.len()))
                             .color(MUTED),
                     );
+                    let n_sel = self.selected_drives.len();
+                    let queue_label = format!("多盘排队扫描（{n_sel}）");
+                    if ui
+                        .add_enabled(
+                            n_sel > 0 && !self.busy(),
+                            theme::ghost_button(&queue_label),
+                        )
+                        .clicked()
+                    {
+                        let roots: Vec<PathBuf> = self
+                            .selected_drives
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect();
+                        self.start_queued_drive_scans(roots, false);
+                    }
+                    if !self.drive_scan_queue.is_empty() {
+                        ui.colored_label(
+                            WARN,
+                            format!("排队剩余 {} 盘", self.drive_scan_queue.len()),
+                        );
+                    }
                 });
                 ui.add_space(8.0);
                 if self.drive_infos.is_empty() {
@@ -1879,8 +2326,17 @@ impl JanitorApp {
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for d in self.drive_infos.clone() {
+                        let key = d.root.display().to_string();
                         theme::card_frame().show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                let mut checked = self.selected_drives.contains(&key);
+                                if ui.checkbox(&mut checked, "").changed() {
+                                    if checked {
+                                        self.selected_drives.insert(key.clone());
+                                    } else {
+                                        self.selected_drives.remove(&key);
+                                    }
+                                }
                                 ui.vertical(|ui| {
                                     ui.label(
                                         egui::RichText::new(&d.label)
@@ -1901,9 +2357,19 @@ impl JanitorApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                !self.busy(),
+                                                theme::accent_button("极速扫描此盘"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.root_input = d.root.display().to_string();
+                                            self.start_scan_with_opts(true);
+                                        }
                                         if ui.add(theme::ghost_button("扫描此盘")).clicked() {
                                             self.root_input = d.root.display().to_string();
-                                            self.start_scan();
+                                            self.start_scan_with_opts(false);
                                         }
                                         if ui.add(theme::ghost_button("设为路径")).clicked() {
                                             self.root_input = d.root.display().to_string();
@@ -1953,6 +2419,7 @@ impl JanitorApp {
                     }
                 }
                 ui.monospace(self.current_dir.display().to_string());
+                let mut expand_here: Option<PathBuf> = None;
                 if let Some(idx) = &self.index {
                     if let Some(e) = idx.get(&self.current_dir) {
                         ui.label(format!(
@@ -1960,6 +2427,15 @@ impl JanitorApp {
                             format_bytes(e.size),
                             if idx.partial { "（扫描中估算）" } else { "" }
                         ));
+                        if e.count_only {
+                            ui.colored_label(WARN, "未展开");
+                            if ui
+                                .add_enabled(!self.busy(), theme::accent_button("深入展开"))
+                                .clicked()
+                            {
+                                expand_here = Some(self.current_dir.clone());
+                            }
+                        }
                     }
                     if idx.skipped_bytes > 0 {
                         ui.colored_label(
@@ -1968,8 +2444,22 @@ impl JanitorApp {
                         );
                     }
                 }
+                if let Some(p) = expand_here {
+                    self.start_expand_count_only(p);
+                }
             });
             ui.separator();
+            if self.config.show_treemap {
+                if let Some(idx) = &self.index {
+                    ui.weak("占用占比（点击文件夹进入）");
+                    if let Some(p) =
+                        treemap::show_treemap(ui, idx, &self.current_dir, 200.0)
+                    {
+                        self.current_dir = p;
+                    }
+                    ui.separator();
+                }
+            }
             let entries = self.take_visible_entries();
             if self.list_total > self.list_limit {
                 ui.colored_label(
@@ -2146,6 +2636,9 @@ impl JanitorApp {
                             if h.sensitive {
                                 ui.colored_label(theme::DANGER, "敏感·勿盲目勾选");
                             }
+                            if h.rule_id.contains("cookie") || h.rule_id.contains("history") {
+                                ui.colored_label(theme::WARN, "隐私·默认不勾选");
+                            }
                         });
                         ui.label(&h.detail);
                         if !h.note.is_empty() {
@@ -2220,6 +2713,22 @@ impl JanitorApp {
                     }
                 });
             }
+            if self.leftovers_scanning && self.leftovers_is_followup {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("正在跟扫残留…");
+                });
+            }
+            if self.leftovers_is_followup && !self.leftovers.is_empty() {
+                ui.separator();
+                ui.heading("跟扫残留结果");
+                ui.colored_label(
+                    WARN,
+                    "默认全不勾选。确认后再清理；误报可点「忽略」加入白名单。",
+                );
+                self.ui_leftovers_hits(ui, ctx);
+                ui.separator();
+            }
             ui.horizontal(|ui| {
                 ui.label("搜索");
                 ui.add(
@@ -2234,7 +2743,91 @@ impl JanitorApp {
                 {
                     self.start_software_scan();
                 }
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new("刷新 Store 应用"))
+                    .clicked()
+                {
+                    self.start_appx_list();
+                }
             });
+            if self.appx_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("正在读取 AppX…");
+                });
+            }
+            if !self.appx_packages.is_empty() {
+                ui.collapsing("Store / AppX 应用", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("筛选");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.appx_filter)
+                                .desired_width(200.0)
+                                .hint_text("包名"),
+                        );
+                    });
+                    let filter = self.appx_filter.to_lowercase();
+                    let mut to_remove: Option<String> = None;
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            for pkg in &self.appx_packages {
+                                if !filter.is_empty()
+                                    && !pkg.name.to_lowercase().contains(&filter)
+                                    && !pkg.package_full_name.to_lowercase().contains(&filter)
+                                {
+                                    continue;
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(&pkg.name);
+                                    ui.weak(&pkg.package_full_name);
+                                    if ui.small_button("卸载 AppX").clicked() {
+                                        to_remove = Some(pkg.package_full_name.clone());
+                                    }
+                                });
+                            }
+                        });
+                    if let Some(full) = to_remove {
+                        match uninstall_appx(&full) {
+                            Ok(()) => {
+                                self.status = format!("已请求卸载 AppX：{full}");
+                                self.appx_packages
+                                    .retain(|p| p.package_full_name != full);
+                            }
+                            Err(e) => self.status = format!("卸载 AppX 失败：{e}"),
+                        }
+                    }
+                });
+            }
+            if self.deep_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("深度查询中…");
+                });
+            }
+            if !self.locking_procs.is_empty() {
+                ui.collapsing(
+                    format!("占用进程（{}）", self.locking_procs.len()),
+                    |ui| {
+                        for p in &self.locking_procs {
+                            ui.label(format!("[{}] {} — {}", p.pid, p.name, p.path));
+                        }
+                    },
+                );
+            }
+            if !self.related_services.is_empty() || !self.related_tasks.is_empty() {
+                ui.collapsing("相关服务 / 计划任务", |ui| {
+                    for s in &self.related_services {
+                        ui.label(format!(
+                            "服务 {} ({}) — {}",
+                            s.name, s.status, s.display_name
+                        ));
+                    }
+                    for t in &self.related_tasks {
+                        ui.label(format!("任务 {}{} — {}", t.path, t.name, t.state));
+                    }
+                });
+            }
             if self.apps_loading {
                 ui.spinner();
                 ui.label("读取中…");
@@ -2248,6 +2841,8 @@ impl JanitorApp {
             let quiet = self.prefer_quiet_uninstall;
             let mut to_uninstall: Option<usize> = None;
             let mut to_follow: Option<usize> = None;
+            let mut to_lock: Option<usize> = None;
+            let mut to_svc: Option<usize> = None;
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (i, app) in self.apps.iter().enumerate() {
                     if !filter.is_empty() {
@@ -2280,6 +2875,18 @@ impl JanitorApp {
                                 {
                                     to_follow = Some(i);
                                 }
+                                if ui
+                                    .add_enabled(!self.busy(), egui::Button::new("查占用进程"))
+                                    .clicked()
+                                {
+                                    to_lock = Some(i);
+                                }
+                                if ui
+                                    .add_enabled(!self.busy(), egui::Button::new("查服务/任务"))
+                                    .clicked()
+                                {
+                                    to_svc = Some(i);
+                                }
                             });
                         });
                         if !app.publisher.is_empty() {
@@ -2292,6 +2899,16 @@ impl JanitorApp {
                     });
                 }
             });
+            if let Some(i) = to_lock {
+                if let Some(app) = self.apps.get(i).cloned() {
+                    self.start_deep_lock_check(&app);
+                }
+            }
+            if let Some(i) = to_svc {
+                if let Some(app) = self.apps.get(i).cloned() {
+                    self.start_deep_svc_check(&app);
+                }
+            }
             if let Some(i) = to_follow {
                 if let Some(app) = self.apps.get(i).cloned() {
                     self.start_leftovers_followup(AppLeftoverHint::from_app(&app));
@@ -2318,6 +2935,75 @@ impl JanitorApp {
                 }
             }
         });
+    }
+
+    /// 残留列表：选择 / 清理确认 / 白名单（软件页与工具页共用）
+    fn ui_leftovers_hits(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            if ui.button("全不选").clicked() {
+                for h in &mut self.leftovers {
+                    h.selected = false;
+                }
+            }
+            if ui.button("仅勾选高置信").clicked() {
+                for h in &mut self.leftovers {
+                    h.selected = h.confidence == Confidence::High;
+                }
+            }
+            let n = self.leftovers.iter().filter(|h| h.selected).count();
+            if ui
+                .add_enabled(n > 0 && !self.busy(), theme::accent_button("清理勾选项"))
+                .clicked()
+            {
+                self.confirm_leftovers = true;
+            }
+            ui.label(format!("白名单 {} 条", self.whitelist.paths.len()));
+        });
+        let mut ignore_idx: Option<usize> = None;
+        let mut open_path: Option<PathBuf> = None;
+        let mut copy_path: Option<PathBuf> = None;
+        for (i, h) in self.leftovers.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut h.selected, "");
+                let (label, color) = match h.confidence {
+                    Confidence::High => ("高", OK),
+                    Confidence::Medium => ("中", WARN),
+                    Confidence::Low => ("低", DANGER),
+                };
+                ui.colored_label(color, label);
+                ui.label(format_bytes(h.size_hint));
+                ui.monospace(h.path.display().to_string());
+                if ui.small_button("忽略").clicked() {
+                    ignore_idx = Some(i);
+                }
+                if ui.small_button("打开").clicked() {
+                    open_path = Some(h.path.clone());
+                }
+                if ui.small_button("复制").clicked() {
+                    copy_path = Some(h.path.clone());
+                }
+            });
+            ui.weak(&h.reason);
+        }
+        if let Some(i) = ignore_idx {
+            if let Some(h) = self.leftovers.get(i).cloned() {
+                if self.whitelist.add(&h.path) {
+                    let _ = self.whitelist.save();
+                    self.push_log(format!("已加入白名单：{}", h.path.display()));
+                }
+                self.leftovers.remove(i);
+                self.status = "已忽略并加入白名单".into();
+            }
+        }
+        if let Some(p) = open_path {
+            if let Err(e) = paths_ui::open_in_explorer(&p) {
+                self.status = e;
+            }
+        }
+        if let Some(p) = copy_path {
+            paths_ui::copy_path_to_clipboard(ctx, &p);
+            self.status = "已复制路径".into();
+        }
     }
 
     fn ui_startup(&mut self, ctx: &egui::Context) {
@@ -2417,7 +3103,7 @@ impl JanitorApp {
     fn ui_shortcuts(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("失效快捷方式");
-            ui.label("只扫桌面（用户桌面 + 公共桌面）一层 .lnk，约 3 秒内结束；与上方路径无关。");
+            ui.label("扫桌面 + 开始菜单一层 .lnk（开始菜单会再进一层文件夹），约数秒内结束；与上方路径无关。");
             if self.shortcuts_scanning {
                 ui.spinner();
                 ui.label("扫描中…");
@@ -2764,66 +3450,7 @@ impl JanitorApp {
                             }
                         });
                         if !self.leftovers.is_empty() {
-                            ui.horizontal(|ui| {
-                                if ui.button("全不选").clicked() {
-                                    for h in &mut self.leftovers {
-                                        h.selected = false;
-                                    }
-                                }
-                                if ui.button("仅勾选高置信").clicked() {
-                                    for h in &mut self.leftovers {
-                                        h.selected = h.confidence == Confidence::High;
-                                    }
-                                }
-                            });
-                            let mut ignore_idx: Option<usize> = None;
-                            let mut open_path: Option<PathBuf> = None;
-                            let mut copy_path: Option<PathBuf> = None;
-                            for (i, h) in self.leftovers.iter_mut().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.checkbox(&mut h.selected, "");
-                                    let (label, color) = match h.confidence {
-                                        Confidence::High => ("高", OK),
-                                        Confidence::Medium => ("中", WARN),
-                                        Confidence::Low => ("低", DANGER),
-                                    };
-                                    ui.colored_label(color, label);
-                                    ui.label(format_bytes(h.size_hint));
-                                    ui.monospace(h.path.display().to_string());
-                                    if ui.small_button("忽略").clicked() {
-                                        ignore_idx = Some(i);
-                                    }
-                                    if ui.small_button("打开").clicked() {
-                                        open_path = Some(h.path.clone());
-                                    }
-                                    if ui.small_button("复制").clicked() {
-                                        copy_path = Some(h.path.clone());
-                                    }
-                                });
-                                ui.weak(&h.reason);
-                            }
-                            if let Some(i) = ignore_idx {
-                                if let Some(h) = self.leftovers.get(i).cloned() {
-                                    if self.whitelist.add(&h.path) {
-                                        let _ = self.whitelist.save();
-                                        self.push_log(format!(
-                                            "已加入白名单：{}",
-                                            h.path.display()
-                                        ));
-                                    }
-                                    self.leftovers.remove(i);
-                                    self.status = "已忽略并加入白名单".into();
-                                }
-                            }
-                            if let Some(p) = open_path {
-                                if let Err(e) = paths_ui::open_in_explorer(&p) {
-                                    self.status = e;
-                                }
-                            }
-                            if let Some(p) = copy_path {
-                                paths_ui::copy_path_to_clipboard(ctx, &p);
-                                self.status = "已复制路径".into();
-                            }
+                            self.ui_leftovers_hits(ui, ctx);
                         }
                     });
 
@@ -2948,6 +3575,157 @@ impl JanitorApp {
                                 let _ = self.config.save();
                             }
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("查重最小体积 (MB)");
+                            let mut mb = self.config.dup_min_mb as i64;
+                            if ui
+                                .add(egui::DragValue::new(&mut mb).range(1..=1024))
+                                .changed()
+                            {
+                                self.config.dup_min_mb = mb as u64;
+                                let _ = self.config.save();
+                            }
+                            ui.label("最多组数");
+                            let mut n = self.config.dup_max_groups;
+                            if ui
+                                .add(egui::DragValue::new(&mut n).range(1..=500))
+                                .changed()
+                            {
+                                self.config.dup_max_groups = n;
+                                let _ = self.config.save();
+                            }
+                        });
+                        if ui
+                            .checkbox(
+                                &mut self.config.quiet_clean_on_start,
+                                "启动时安静清理安全垃圾（仅勾选项，非敏感）",
+                            )
+                            .changed()
+                        {
+                            let _ = self.config.save();
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.config.show_treemap,
+                                "浏览页显示 Treemap 占用图",
+                            )
+                            .changed()
+                        {
+                            let _ = self.config.save();
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("默认扫描模式");
+                            let turbo = self.config.scan_mode == "turbo";
+                            if ui
+                                .selectable_label(!turbo, "普通")
+                                .clicked()
+                            {
+                                self.config.scan_mode = "normal".into();
+                                let _ = self.config.save();
+                            }
+                            if ui.selectable_label(turbo, "极速").clicked() {
+                                self.config.scan_mode = "turbo".into();
+                                let _ = self.config.save();
+                            }
+                        });
+                        if ui
+                            .checkbox(
+                                &mut self.config.shred_default,
+                                "删除确认默认勾选「安全粉碎」",
+                            )
+                            .changed()
+                        {
+                            self.shred_delete = self.config.shred_default;
+                            let _ = self.config.save();
+                        }
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new("排除路径（每行一条，扫描时跳过此前缀）")
+                                .color(MUTED)
+                                .size(13.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.exclude_edit)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(4)
+                                .hint_text(r"例如 D:\HugeRepo\node_modules"),
+                        );
+                        if ui.add(theme::ghost_button("保存排除列表")).clicked() {
+                            self.config.exclude_paths = self
+                                .exclude_edit
+                                .lines()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                            match self.config.save() {
+                                Ok(()) => {
+                                    self.status = format!(
+                                        "已保存 {} 条排除路径",
+                                        self.config.exclude_paths.len()
+                                    )
+                                }
+                                Err(e) => self.status = format!("保存失败：{e}"),
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("每日安静清理（计划任务）")
+                                .color(ACCENT)
+                                .strong()
+                                .size(14.0),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("时间 HH:MM");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.schedule_time)
+                                    .desired_width(70.0),
+                            );
+                            let mut en = self.config.schedule_quiet_clean;
+                            if ui.checkbox(&mut en, "启用每日安静清理").changed() {
+                                self.config.schedule_quiet_clean = en;
+                                let exe = std::env::current_exe().ok();
+                                if en {
+                                    if let Some(exe) = exe {
+                                        match schedule::install_daily_task(
+                                            &exe,
+                                            &self.config.schedule_time,
+                                        ) {
+                                            Ok(()) => {
+                                                self.schedule_status =
+                                                    "已安装计划任务 DiskJanitorQuietClean".into();
+                                                let _ = self.config.save();
+                                            }
+                                            Err(e) => {
+                                                self.config.schedule_quiet_clean = false;
+                                                self.schedule_status = format!("安装失败：{e}");
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    match schedule::remove_daily_task() {
+                                        Ok(()) => {
+                                            self.schedule_status = "已移除计划任务".into();
+                                            let _ = self.config.save();
+                                        }
+                                        Err(e) => {
+                                            self.schedule_status = format!("移除失败：{e}");
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.small_button("刷新状态").clicked() {
+                                let on = schedule::task_installed();
+                                self.config.schedule_quiet_clean = on;
+                                self.schedule_status = if on {
+                                    "计划任务已安装".into()
+                                } else {
+                                    "未安装计划任务".into()
+                                };
+                            }
+                        });
+                        if !self.schedule_status.is_empty() {
+                            ui.weak(&self.schedule_status);
+                        }
                         if self.config.last_scan_root.trim().is_empty() {
                             ui.weak("上次扫描路径：无");
                         } else {
@@ -3076,11 +3854,40 @@ impl JanitorApp {
             });
     }
 
+    fn ui_about(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                if self.about_assets.is_none() {
+                    self.about_assets = Some(AboutAssets::load(ctx));
+                }
+                let mut panel = self.about_panel;
+                let mut tip = std::mem::take(&mut self.about_tip);
+                if let Some(assets) = self.about_assets.as_ref() {
+                    about::draw_about(
+                        ui,
+                        &mut panel,
+                        assets,
+                        APP_VERSION_NAME,
+                        APP_VERSION_CODE,
+                        &mut tip,
+                    );
+                }
+                self.about_panel = panel;
+                self.about_tip = tip;
+            });
+    }
+
     fn ui_entry_list(&mut self, ui: &mut egui::Ui, entries: Vec<FsEntry>) {
         let mut open_dir: Option<PathBuf> = None;
         let mut toggle: Option<(String, bool)> = None;
         let mut open_loc: Option<PathBuf> = None;
         let mut copy_path: Option<PathBuf> = None;
+        let mut expand_path: Option<PathBuf> = None;
 
         let parent_size = self
             .index
@@ -3119,6 +3926,15 @@ impl JanitorApp {
                         } else if resp.clicked() {
                             toggle = Some((key.clone(), !checked));
                         }
+                        if e.count_only {
+                            ui.colored_label(WARN, "未展开");
+                            if ui
+                                .add_enabled(!self.busy(), egui::Button::new("深入展开"))
+                                .clicked()
+                            {
+                                expand_path = Some(e.path.clone());
+                            }
+                        }
                         let ratio = (e.size as f32 / bar_den as f32).clamp(0.0, 1.0);
                         ui.add(egui::ProgressBar::new(ratio).desired_width(72.0));
                         if ui.small_button("打开").clicked() {
@@ -3155,6 +3971,9 @@ impl JanitorApp {
         if let Some(p) = copy_path {
             paths_ui::copy_path_to_clipboard(ui.ctx(), &p);
             self.status = "已复制路径".into();
+        }
+        if let Some(p) = expand_path {
+            self.start_expand_count_only(p);
         }
     }
 
@@ -3195,6 +4014,22 @@ impl JanitorApp {
                         &mut self.allow_permanent_delete,
                         "回收站失败时允许直接删除",
                     );
+                    if ui
+                        .checkbox(
+                            &mut self.shred_delete,
+                            "安全粉碎（仅文件，不可进回收站）",
+                        )
+                        .changed()
+                        && self.shred_delete
+                    {
+                        self.allow_permanent_delete = true;
+                    }
+                    if self.shred_delete {
+                        ui.colored_label(
+                            DANGER,
+                            "粉碎将覆写后永久删除，无法从回收站恢复。",
+                        );
+                    }
                     ui.weak("提示：WSL 的 ext4.vhdx 若占用，请先在终端执行 wsl --shutdown");
                     ui.horizontal(|ui| {
                         if ui.button("取消").clicked() {

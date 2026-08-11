@@ -114,10 +114,100 @@ const RULES: &[JunkRule] = &[
         sensitive: false,
         default_selected: false,
     },
+    JunkRule {
+        id: "win_update_download",
+        title: "Windows Update 下载缓存",
+        detail: "SoftwareDistribution\\Download（敏感，默认不勾选）",
+        sensitive: true,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "chrome_cache_profiles",
+        title: "Chrome 其他配置缓存",
+        detail: "User Data\\Profile *\\Cache 等（默认不勾选）",
+        sensitive: false,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "edge_profile_cache",
+        title: "Edge 其他配置缓存",
+        detail: "User Data\\Profile *\\Cache 等（默认不勾选）",
+        sensitive: false,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "windows_old",
+        title: "Windows.old",
+        detail: "系统盘根目录 Windows.old（升级残留，体积大）",
+        sensitive: true,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "cbs_logs",
+        title: "CBS 日志",
+        detail: "Windows\\Logs\\CBS",
+        sensitive: true,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "font_cache",
+        title: "字体缓存",
+        detail: "Local\\FontCache / Service\\FontCache",
+        sensitive: false,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "directx_shader",
+        title: "DirectX 着色器缓存",
+        detail: "D3DSCache / DXCache",
+        sensitive: false,
+        default_selected: true,
+    },
+    JunkRule {
+        id: "edge_cookies",
+        title: "隐私·Edge Cookies（默认不勾选）",
+        detail: "User Data\\Default\\Network\\Cookies",
+        sensitive: true,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "chrome_cookies",
+        title: "隐私·Chrome Cookies（默认不勾选）",
+        detail: "User Data\\Default\\Network\\Cookies",
+        sensitive: true,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "edge_history",
+        title: "隐私·Edge 历史（默认不勾选）",
+        detail: "User Data\\Default\\History",
+        sensitive: true,
+        default_selected: false,
+    },
+    JunkRule {
+        id: "chrome_history",
+        title: "隐私·Chrome 历史（默认不勾选）",
+        detail: "User Data\\Default\\History",
+        sensitive: true,
+        default_selected: false,
+    },
 ];
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
+}
+
+fn browser_cache_names() -> &'static [&'static str] {
+    &["Cache", "Code Cache", "GPUCache", "Service Worker"]
+}
+
+fn push_browser_profile_caches(out: &mut Vec<PathBuf>, profile_dir: &Path) {
+    for name in browser_cache_names() {
+        let p = profile_dir.join(name);
+        if p.exists() {
+            out.push(p);
+        }
+    }
 }
 
 fn browser_cache_dirs(product: &str, company: &str) -> Vec<PathBuf> {
@@ -125,15 +215,24 @@ fn browser_cache_dirs(product: &str, company: &str) -> Vec<PathBuf> {
     let Some(local) = env_path("LOCALAPPDATA") else {
         return out;
     };
-    let base = local
-        .join(company)
-        .join(product)
-        .join("User Data")
-        .join("Default");
-    for name in ["Cache", "Code Cache", "GPUCache", "Service Worker"] {
-        let p = base.join(name);
-        if p.exists() {
-            out.push(p);
+    let user_data = local.join(company).join(product).join("User Data");
+    push_browser_profile_caches(&mut out, &user_data.join("Default"));
+    out
+}
+
+fn browser_profile_cache_dirs(product: &str, company: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(local) = env_path("LOCALAPPDATA") else {
+        return out;
+    };
+    let user_data = local.join(company).join(product).join("User Data");
+    if let Ok(rd) = std::fs::read_dir(&user_data) {
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("Profile ") {
+                push_browser_profile_caches(&mut out, &ent.path());
+            }
         }
     }
     out
@@ -166,16 +265,22 @@ fn rule_paths(id: &str) -> Vec<PathBuf> {
             out.push(PathBuf::from(
                 r"C:\Windows\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache",
             ));
+        }
+        "win_update_download" => {
             if let Some(win) = std::env::var_os("SystemRoot") {
                 out.push(
                     PathBuf::from(win)
                         .join("SoftwareDistribution")
                         .join("Download"),
                 );
+            } else {
+                out.push(PathBuf::from(r"C:\Windows\SoftwareDistribution\Download"));
             }
         }
         "chrome_cache" => out.extend(browser_cache_dirs("Chrome", "Google")),
         "edge_cache" => out.extend(browser_cache_dirs("Edge", "Microsoft")),
+        "chrome_cache_profiles" => out.extend(browser_profile_cache_dirs("Chrome", "Google")),
+        "edge_profile_cache" => out.extend(browser_profile_cache_dirs("Edge", "Microsoft")),
         "firefox_cache" => {
             if let Some(local) = env_path("LOCALAPPDATA") {
                 let profiles = local.join("Mozilla").join("Firefox").join("Profiles");
@@ -207,6 +312,97 @@ fn rule_paths(id: &str) -> Vec<PathBuf> {
         "downloads_large_old" => {
             if let Some(user) = env_path("USERPROFILE") {
                 out.push(user.join("Downloads"));
+            }
+        }
+        "windows_old" => {
+            for letter in [b'C', b'D', b'E'] {
+                let p = PathBuf::from(format!("{}:\\Windows.old", letter as char));
+                if p.exists() {
+                    out.push(p);
+                }
+            }
+        }
+        "cbs_logs" => {
+            if let Some(win) = std::env::var_os("SystemRoot") {
+                out.push(PathBuf::from(win).join("Logs").join("CBS"));
+            } else {
+                out.push(PathBuf::from(r"C:\Windows\Logs\CBS"));
+            }
+        }
+        "font_cache" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(local.join("FontCache"));
+                out.push(
+                    local
+                        .join("Microsoft")
+                        .join("Windows")
+                        .join("Fonts")
+                        .join("FontCache"),
+                );
+            }
+            out.push(PathBuf::from(
+                r"C:\Windows\ServiceProfiles\LocalService\AppData\Local\FontCache",
+            ));
+        }
+        "directx_shader" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(local.join("D3DSCache"));
+                out.push(
+                    local
+                        .join("Microsoft")
+                        .join("Windows")
+                        .join("DXCache"),
+                );
+            }
+        }
+        "edge_cookies" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(
+                    local
+                        .join("Microsoft")
+                        .join("Edge")
+                        .join("User Data")
+                        .join("Default")
+                        .join("Network")
+                        .join("Cookies"),
+                );
+            }
+        }
+        "chrome_cookies" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(
+                    local
+                        .join("Google")
+                        .join("Chrome")
+                        .join("User Data")
+                        .join("Default")
+                        .join("Network")
+                        .join("Cookies"),
+                );
+            }
+        }
+        "edge_history" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(
+                    local
+                        .join("Microsoft")
+                        .join("Edge")
+                        .join("User Data")
+                        .join("Default")
+                        .join("History"),
+                );
+            }
+        }
+        "chrome_history" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(
+                    local
+                        .join("Google")
+                        .join("Chrome")
+                        .join("User Data")
+                        .join("Default")
+                        .join("History"),
+                );
             }
         }
         _ => {}
@@ -320,6 +516,15 @@ pub fn scan_junk(cancel: &AtomicBool) -> Vec<JunkHit> {
                 }
                 note = format!("{} 个数据库", paths.len());
             }
+            "edge_cookies" | "chrome_cookies" | "edge_history" | "chrome_history" => {
+                for b in &bases {
+                    if let Ok(meta) = std::fs::metadata(b) {
+                        size += meta.len();
+                        paths.push(b.clone());
+                    }
+                }
+                note = "隐私数据·默认不勾选".into();
+            }
             _ => {
                 for b in &bases {
                     let (sz, files) = quick_dir_size(b, cancel, 400_000);
@@ -384,7 +589,12 @@ pub fn apply_safe_selection(hits: &mut [JunkHit]) {
 fn is_safe_rule(id: &str) -> bool {
     matches!(
         id,
-        "user_temp" | "thumbcache" | "chrome_cache" | "edge_cache" | "firefox_cache"
+        "user_temp"
+            | "thumbcache"
+            | "chrome_cache"
+            | "edge_cache"
+            | "firefox_cache"
+            | "directx_shader"
     )
 }
 
@@ -393,6 +603,13 @@ pub fn safe_selected_size(hits: &[JunkHit]) -> u64 {
         .filter(|h| h.selected && !h.sensitive && is_safe_rule(&h.rule_id))
         .map(|h| h.size)
         .sum()
+}
+
+/// 仅保留非敏感且已勾选的项（用于安静清理）
+pub fn safe_junk_hits(hits: Vec<JunkHit>) -> Vec<JunkHit> {
+    hits.into_iter()
+        .filter(|h| !h.sensitive && h.selected && h.size > 0)
+        .collect()
 }
 
 pub fn reclaimable_estimate(junk: &[JunkHit], dup_waste: u64) -> u64 {

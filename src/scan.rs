@@ -1,12 +1,57 @@
-//! 并行扫盘引擎（支持增量快照；跳过目录可估算占用）
+//! 并行扫盘引擎（支持增量快照；跳过目录可估算占用；可续扫 / 强制展开；排除列表 / 极速）
 
 use crate::model::{format_bytes, FsEntry, ScanIndex};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+/// 扫描选项：排除路径（前缀匹配，大小写不敏感）与极速模式。
+#[derive(Debug, Clone, Default)]
+pub struct ScanOptions {
+    pub excludes: Vec<PathBuf>,
+    /// 极速：不把 node_modules/.git 标为 CountOnly；提高估算上限。
+    pub turbo: bool,
+}
+
+impl ScanOptions {
+    pub fn quick_limit(&self) -> u64 {
+        if self.turbo {
+            500_000
+        } else {
+            80_000
+        }
+    }
+}
+
+/// 路径是否命中排除前缀（大小写不敏感）。
+pub fn path_is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+    let key = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\");
+    for ex in excludes {
+        let mut ek = ex
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .replace('/', "\\");
+        while ek.ends_with('\\') {
+            ek.pop();
+        }
+        if ek.is_empty() {
+            continue;
+        }
+        if key == ek || key.starts_with(&format!("{ek}\\")) {
+            return true;
+        }
+    }
+    false
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -44,21 +89,50 @@ enum SkipKind {
     CountOnly,
 }
 
-pub fn scan_path<F>(root: PathBuf, cancel: Arc<AtomicBool>, mut on_event: F) -> ScanIndex
+/// 全新扫描（默认选项）
+pub fn scan_path<F>(root: PathBuf, cancel: Arc<AtomicBool>, on_event: F) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
+    scan_path_ex(root, cancel, on_event, ScanOptions::default())
+}
+
+/// 带排除列表的扫描。
+pub fn scan_path_filtered<F>(
+    root: PathBuf,
+    cancel: Arc<AtomicBool>,
+    on_event: F,
+    excludes: &[PathBuf],
+) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
+    scan_path_ex(
+        root,
+        cancel,
+        on_event,
+        ScanOptions {
+            excludes: excludes.to_vec(),
+            turbo: false,
+        },
+    )
+}
+
+/// 全新扫描（排除列表 + 极速）
+pub fn scan_path_ex<F>(
+    root: PathBuf,
+    cancel: Arc<AtomicBool>,
+    mut on_event: F,
+    opts: ScanOptions,
+) -> ScanIndex
 where
     F: FnMut(ScanEvent),
 {
     let started = Instant::now();
-    let visited = Arc::new(AtomicU64::new(0));
-    let skipped = Arc::new(AtomicU64::new(0));
-    let bytes_seen = Arc::new(AtomicU64::new(0));
-    let skipped_bytes = Arc::new(AtomicU64::new(0));
-
     let mut index = ScanIndex {
         root: root.clone(),
         ..Default::default()
     };
-    let mut skipped_notes: Vec<String> = Vec::new();
 
     if !root.exists() {
         let msg = format!("路径不存在: {}", root.display());
@@ -78,9 +152,10 @@ where
     }
 
     let mut raws: Vec<Raw> = Vec::new();
-    let mut stack = vec![root.clone()];
-    let mut last_ui = Instant::now();
-    let mut last_partial = Instant::now();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let visited0 = Arc::new(AtomicU64::new(0));
+    let bytes0 = Arc::new(AtomicU64::new(0));
+    let quick_lim = opts.quick_limit();
 
     if let Ok(meta) = std::fs::metadata(&root) {
         raws.push(Raw {
@@ -91,22 +166,58 @@ where
             forced_dir_size: None,
         });
     }
+    let empty_force = HashSet::new();
+    let mut skipped0 = 0u64;
+    let mut skipped_bytes0 = 0u64;
+    let mut skipped_notes: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&root) {
         for ent in rd.flatten() {
             let path = ent.path();
+            if path_is_excluded(&path, &opts.excludes) {
+                skipped0 += 1;
+                continue;
+            }
             if let Ok(meta) = std::fs::symlink_metadata(&path) {
                 let ft = meta.file_type();
                 if ft.is_symlink() {
                     continue;
+                }
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if let Some(kind) = should_skip_dir(&path, name, &empty_force, opts.turbo) {
+                    skipped0 += 1;
+                    match kind {
+                        SkipKind::Ignore => continue,
+                        SkipKind::CountOnly => {
+                            let (sz, _) = quick_dir_size(&path, cancel.as_ref(), quick_lim);
+                            skipped_bytes0 += sz;
+                            bytes0.fetch_add(sz, Ordering::Relaxed);
+                            visited0.fetch_add(1, Ordering::Relaxed);
+                            if skipped_notes.len() < 30 {
+                                skipped_notes.push(format!(
+                                    "{} ≈ {}（未展开）",
+                                    path.display(),
+                                    format_bytes(sz)
+                                ));
+                            }
+                            raws.push(Raw {
+                                path,
+                                is_dir: true,
+                                file_size: 0,
+                                mtime: meta.modified().ok(),
+                                forced_dir_size: Some(sz),
+                            });
+                            continue;
+                        }
+                    }
                 }
                 let is_dir = ft.is_dir();
                 let file_size = if is_dir { 0 } else { meta.len() };
                 if is_dir {
                     stack.push(path.clone());
                 } else {
-                    bytes_seen.fetch_add(file_size, Ordering::Relaxed);
+                    bytes0.fetch_add(file_size, Ordering::Relaxed);
                 }
-                visited.fetch_add(1, Ordering::Relaxed);
+                visited0.fetch_add(1, Ordering::Relaxed);
                 raws.push(Raw {
                     path,
                     is_dir,
@@ -116,32 +227,242 @@ where
                 });
             }
         }
-        stack.retain(|p| p != &root);
         let snap = finish_counts(build_index(
             index.clone(),
             &raws,
             &root,
-            0,
-            0,
-            &[],
+            skipped0,
+            skipped_bytes0,
+            &skipped_notes,
             true,
         ));
         on_event(ScanEvent::Partial(snap));
     }
 
+    run_scan_loop(
+        root,
+        index,
+        raws,
+        stack,
+        HashSet::new(),
+        visited0,
+        Arc::new(AtomicU64::new(skipped0)),
+        bytes0,
+        Arc::new(AtomicU64::new(skipped_bytes0)),
+        skipped_notes,
+        started,
+        cancel,
+        opts,
+        on_event,
+    )
+}
+
+/// 从取消时留下的剩余目录栈继续扫，合并进 base_index
+pub fn resume_scan<F>(
+    root: PathBuf,
+    base_index: ScanIndex,
+    remaining: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+    on_event: F,
+) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
+    resume_scan_ex(
+        root,
+        base_index,
+        remaining,
+        cancel,
+        on_event,
+        ScanOptions::default(),
+    )
+}
+
+pub fn resume_scan_ex<F>(
+    root: PathBuf,
+    base_index: ScanIndex,
+    remaining: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+    on_event: F,
+    opts: ScanOptions,
+) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
+    let started = Instant::now();
+    let raws = raws_from_index(&base_index);
+    let skipped = Arc::new(AtomicU64::new(base_index.skipped));
+    let skipped_bytes = Arc::new(AtomicU64::new(base_index.skipped_bytes));
+    let notes = base_index.skipped_notes.clone();
+    let (visited, bytes_seen) = counters_from_raws(&raws);
+    let mut index = base_index;
+    index.root = root.clone();
+    index.resume_stack.clear();
+    index.partial = true;
+
+    run_scan_loop(
+        root,
+        index,
+        raws,
+        remaining,
+        HashSet::new(),
+        visited,
+        skipped,
+        bytes_seen,
+        skipped_bytes,
+        notes,
+        started,
+        cancel,
+        opts,
+        on_event,
+    )
+}
+
+/// 强制展开此前 CountOnly 的目录，合并进 root_index，清除该目录 count_only 并重算占用
+pub fn expand_count_only_dir<F>(
+    root_index: ScanIndex,
+    expand_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    on_event: F,
+) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
+    let started = Instant::now();
+    let root = root_index.root.clone();
+    let expand_key = ScanIndex::key_norm(&expand_dir);
+    let expand_prefix = {
+        let base = expand_key.trim_end_matches(['\\', '/']);
+        format!("{base}\\")
+    };
+
+    let was = root_index.get(&expand_dir).cloned();
+    let mut skipped_n = root_index.skipped;
+    let mut skipped_b = root_index.skipped_bytes;
+    let mut notes = root_index.skipped_notes.clone();
+    if was.as_ref().map(|e| e.count_only).unwrap_or(false) {
+        skipped_n = skipped_n.saturating_sub(1);
+        skipped_b = skipped_b.saturating_sub(was.as_ref().map(|e| e.size).unwrap_or(0));
+        let marker = expand_dir.display().to_string();
+        notes.retain(|n| !n.contains(&marker));
+    }
+
+    let mut raws = raws_from_index(&root_index);
+    raws.retain(|r| {
+        let k = ScanIndex::key_norm(&r.path);
+        k == expand_key || !k.starts_with(&expand_prefix)
+    });
+    for r in &mut raws {
+        if ScanIndex::key_norm(&r.path) == expand_key {
+            r.forced_dir_size = None;
+            r.file_size = 0;
+        }
+    }
+    if !raws.iter().any(|r| ScanIndex::key_norm(&r.path) == expand_key) {
+        if let Ok(meta) = std::fs::metadata(&expand_dir) {
+            raws.push(Raw {
+                path: expand_dir.clone(),
+                is_dir: meta.is_dir(),
+                file_size: 0,
+                mtime: meta.modified().ok(),
+                forced_dir_size: None,
+            });
+        }
+    }
+
+    let mut force_set = HashSet::new();
+    force_set.insert(expand_key);
+
+    let (visited, bytes_seen) = counters_from_raws(&raws);
+    let mut index = root_index;
+    index.resume_stack.clear();
+    index.partial = true;
+
+    run_scan_loop(
+        root,
+        index,
+        raws,
+        vec![expand_dir],
+        force_set,
+        visited,
+        Arc::new(AtomicU64::new(skipped_n)),
+        bytes_seen,
+        Arc::new(AtomicU64::new(skipped_b)),
+        notes,
+        started,
+        cancel,
+        ScanOptions::default(),
+        on_event,
+    )
+}
+
+fn counters_from_raws(raws: &[Raw]) -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+    let visited = raws.len() as u64;
+    let bytes: u64 = raws
+        .iter()
+        .map(|r| r.forced_dir_size.unwrap_or(r.file_size))
+        .sum();
+    (
+        Arc::new(AtomicU64::new(visited)),
+        Arc::new(AtomicU64::new(bytes)),
+    )
+}
+
+fn raws_from_index(index: &ScanIndex) -> Vec<Raw> {
+    index
+        .entries
+        .values()
+        .map(|e| Raw {
+            path: e.path.clone(),
+            is_dir: e.is_dir,
+            file_size: if e.is_dir { 0 } else { e.size },
+            mtime: e.mtime,
+            forced_dir_size: if e.count_only { Some(e.size) } else { None },
+        })
+        .collect()
+}
+
+fn run_scan_loop<F>(
+    root: PathBuf,
+    mut index: ScanIndex,
+    mut raws: Vec<Raw>,
+    mut stack: Vec<PathBuf>,
+    force_set: HashSet<String>,
+    visited: Arc<AtomicU64>,
+    skipped: Arc<AtomicU64>,
+    bytes_seen: Arc<AtomicU64>,
+    skipped_bytes: Arc<AtomicU64>,
+    mut skipped_notes: Vec<String>,
+    started: Instant,
+    cancel: Arc<AtomicBool>,
+    opts: ScanOptions,
+    mut on_event: F,
+) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
+    let mut last_ui = Instant::now();
+    let mut last_partial = Instant::now();
+    let quick_lim = opts.quick_limit();
+    let turbo = opts.turbo;
+    let excludes = opts.excludes.clone();
+
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
             let skipped_n = skipped.load(Ordering::Relaxed);
             let sb = skipped_bytes.load(Ordering::Relaxed);
-            let done = finish_counts(build_index(
+            let mut resume = stack;
+            resume.push(dir.clone());
+            let mut done = finish_counts(build_index(
                 index,
                 &raws,
                 &root,
                 skipped_n,
                 sb,
                 &skipped_notes,
-                true, // 取消时标记为未完整扫描
+                true,
             ));
+            done.resume_stack = resume;
             on_event(ScanEvent::Progress(ScanProgress {
                 visited: visited.load(Ordering::Relaxed),
                 skipped: skipped_n,
@@ -156,6 +477,11 @@ where
             return done;
         }
 
+        if path_is_excluded(&dir, &excludes) {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
         let rd = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
@@ -168,10 +494,16 @@ where
         };
 
         let children: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        let force_ref = &force_set;
+        let excludes_ref = &excludes;
         let chunk: Vec<Raw> = children
             .par_iter()
             .filter_map(|path| {
                 if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                if path_is_excluded(path, excludes_ref) {
+                    skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
                 let meta = match std::fs::symlink_metadata(path) {
@@ -193,12 +525,12 @@ where
                     });
                 }
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if let Some(kind) = should_skip_dir(name) {
+                if let Some(kind) = should_skip_dir(path, name, force_ref, turbo) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     match kind {
                         SkipKind::Ignore => return None,
                         SkipKind::CountOnly => {
-                            let (sz, _) = quick_dir_size(path, cancel.as_ref(), 80_000);
+                            let (sz, _) = quick_dir_size(path, cancel.as_ref(), quick_lim);
                             skipped_bytes.fetch_add(sz, Ordering::Relaxed);
                             bytes_seen.fetch_add(sz, Ordering::Relaxed);
                             visited.fetch_add(1, Ordering::Relaxed);
@@ -267,14 +599,16 @@ where
         }
 
         let n = raws.len();
-        let interval = if n > 80_000 {
+        let interval = if n > 120_000 {
+            Duration::from_secs(20)
+        } else if n > 80_000 {
             Duration::from_secs(10)
         } else if n > 20_000 {
             Duration::from_secs(5)
         } else {
             Duration::from_secs(3)
         };
-        if n <= 120_000 && last_partial.elapsed() >= interval {
+        if last_partial.elapsed() >= interval {
             last_partial = Instant::now();
             let skipped_n = skipped.load(Ordering::Relaxed);
             let sb = skipped_bytes.load(Ordering::Relaxed);
@@ -298,7 +632,7 @@ where
     let skipped_n = skipped.load(Ordering::Relaxed);
     let sb = skipped_bytes.load(Ordering::Relaxed);
     let cancelled = cancel.load(Ordering::Relaxed);
-    let done = finish_counts(build_index(
+    let mut done = finish_counts(build_index(
         index,
         &raws,
         &root,
@@ -307,6 +641,9 @@ where
         &skipped_notes,
         cancelled,
     ));
+    if !cancelled {
+        done.resume_stack.clear();
+    }
     on_event(ScanEvent::Progress(ScanProgress {
         visited: visited.load(Ordering::Relaxed),
         skipped: skipped_n,
@@ -328,10 +665,19 @@ fn finish_counts(mut index: ScanIndex) -> ScanIndex {
     index
 }
 
-fn should_skip_dir(name: &str) -> Option<SkipKind> {
+fn should_skip_dir(
+    path: &Path,
+    name: &str,
+    force_set: &HashSet<String>,
+    turbo: bool,
+) -> Option<SkipKind> {
+    if force_set.contains(&ScanIndex::key_norm(path)) {
+        return None;
+    }
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
         "$recycle.bin" | "system volume information" | "csc" => Some(SkipKind::Ignore),
+        "node_modules" | ".git" | ".svn" if turbo => None,
         "winsxs"
         | "installer"
         | "servicing"
@@ -378,6 +724,7 @@ fn build_index(
                 is_dir: r.is_dir,
                 size: r.file_size,
                 mtime: r.mtime,
+                count_only: r.forced_dir_size.is_some(),
             },
         );
         let add = if let Some(fs) = r.forced_dir_size {
@@ -481,6 +828,10 @@ mod tests {
         let idx = scan_path(dir.path().to_path_buf(), cancel, |_| {});
         assert!(idx.skipped_bytes >= 2000 || idx.get(&nm).map(|e| e.size).unwrap_or(0) >= 2000);
         assert_eq!(idx.get(dir.path()).unwrap().size, 2000);
+        assert!(
+            idx.get(&nm).map(|e| e.count_only).unwrap_or(false),
+            "node_modules should be count_only"
+        );
     }
 
     #[test]
@@ -496,5 +847,29 @@ mod tests {
         idx.remove_cascade(&a);
         assert!(idx.get(&a).is_none());
         assert_eq!(idx.get(dir.path()).unwrap().size, 100);
+    }
+
+    #[test]
+    fn exclude_prefix_skips_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep");
+        let skip = dir.path().join("skip_me");
+        fs::create_dir_all(&keep).unwrap();
+        fs::create_dir_all(&skip).unwrap();
+        fs::write(keep.join("a.txt"), vec![1u8; 100]).unwrap();
+        fs::write(skip.join("b.txt"), vec![1u8; 500]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let excludes = vec![skip.clone()];
+        let idx = scan_path_filtered(dir.path().to_path_buf(), cancel, |_| {}, &excludes);
+        assert!(idx.get(&skip).is_none());
+        assert_eq!(idx.get(dir.path()).unwrap().size, 100);
+    }
+
+    #[test]
+    fn path_exclude_case_insensitive() {
+        let p = PathBuf::from(r"C:\Users\Foo\Bar");
+        let ex = vec![PathBuf::from(r"c:\users\foo")];
+        assert!(path_is_excluded(&p, &ex));
+        assert!(!path_is_excluded(&PathBuf::from(r"C:\Users\Other"), &ex));
     }
 }

@@ -1,12 +1,12 @@
-//! 失效快捷方式：只扫桌面 .lnk；自写轻量解析（不用 lnk 库）；硬超时
+//! 失效快捷方式：桌面 + 开始菜单 .lnk；自写轻量解析；硬超时
 
 use crate::software::expand_env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const MAX_LNKS: usize = 200;
-const SCAN_BUDGET: Duration = Duration::from_secs(3);
+const MAX_LNKS: usize = 400;
+const SCAN_BUDGET: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone)]
 pub struct BrokenShortcut {
@@ -22,7 +22,7 @@ pub fn scan_broken_shortcuts(cancel: &AtomicBool) -> Vec<BrokenShortcut> {
     let mut checked = 0usize;
     let local = local_fixed_letters();
 
-    // 只扫桌面（用户 + 公共），不进开始菜单，避免又慢又容易卡
+    // 桌面 + 开始菜单
     for root in shortcut_roots() {
         if stop(cancel, started) || checked >= MAX_LNKS {
             break;
@@ -40,13 +40,20 @@ fn stop(cancel: &AtomicBool, started: Instant) -> bool {
 fn shortcut_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(up) = std::env::var("USERPROFILE") {
-        roots.push(PathBuf::from(up).join("Desktop"));
+        let up = PathBuf::from(up);
+        roots.push(up.join("Desktop"));
+        // 开始菜单（用户）
+        roots.push(up.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs"));
     }
     roots.push(PathBuf::from(r"C:\Users\Public\Desktop"));
+    // 开始菜单（公共）
+    roots.push(PathBuf::from(
+        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs",
+    ));
     roots
 }
 
-/// 只扫该目录下一层的 .lnk，不递归
+/// 只扫该目录下一层的 .lnk；开始菜单会再往下扫一层文件夹里的 .lnk
 fn scan_dir_flat(
     dir: &Path,
     cancel: &AtomicBool,
@@ -63,6 +70,52 @@ fn scan_dir_flat(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "Desktop".into());
 
+    let mut subdirs = Vec::new();
+    for ent in rd.flatten() {
+        if stop(cancel, started) || *checked >= MAX_LNKS {
+            return;
+        }
+        let path = ent.path();
+        if path.is_dir() {
+            // 开始菜单：多扫一层
+            if location.eq_ignore_ascii_case("Programs") || dir.to_string_lossy().contains("Start Menu") {
+                subdirs.push(path);
+            }
+            continue;
+        }
+        if !path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("lnk"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        check_one_lnk(&path, &location, cancel, started, local, out, checked);
+    }
+    for sub in subdirs {
+        if stop(cancel, started) || *checked >= MAX_LNKS {
+            return;
+        }
+        scan_dir_flat_one_level(&sub, cancel, started, local, out, checked);
+    }
+}
+
+fn scan_dir_flat_one_level(
+    dir: &Path,
+    cancel: &AtomicBool,
+    started: Instant,
+    local: &[u8],
+    out: &mut Vec<BrokenShortcut>,
+    checked: &mut usize,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let location = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "StartMenu".into());
     for ent in rd.flatten() {
         if stop(cancel, started) || *checked >= MAX_LNKS {
             return;
@@ -76,28 +129,43 @@ fn scan_dir_flat(
         {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(&path) else {
-            continue;
-        };
-        if !meta.is_file() || meta.len() > 32 * 1024 {
-            continue;
-        }
-        *checked += 1;
-        let Some(target) = read_lnk_local_path(&path) else {
-            continue;
-        };
-        let t = target.trim().to_string();
-        if t.is_empty() || !should_check_target(&t, local) {
-            continue;
-        }
-        if !Path::new(&t).exists() {
-            out.push(BrokenShortcut {
-                path,
-                target: t,
-                location: location.clone(),
-                selected: true,
-            });
-        }
+        check_one_lnk(&path, &location, cancel, started, local, out, checked);
+    }
+}
+
+fn check_one_lnk(
+    path: &Path,
+    location: &str,
+    cancel: &AtomicBool,
+    started: Instant,
+    local: &[u8],
+    out: &mut Vec<BrokenShortcut>,
+    checked: &mut usize,
+) {
+    if stop(cancel, started) || *checked >= MAX_LNKS {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.is_file() || meta.len() > 32 * 1024 {
+        return;
+    }
+    *checked += 1;
+    let Some(target) = read_lnk_local_path(path) else {
+        return;
+    };
+    let t = target.trim().to_string();
+    if t.is_empty() || !should_check_target(&t, local) {
+        return;
+    }
+    if !Path::new(&t).exists() {
+        out.push(BrokenShortcut {
+            path: path.to_path_buf(),
+            target: t,
+            location: location.to_string(),
+            selected: true,
+        });
     }
 }
 

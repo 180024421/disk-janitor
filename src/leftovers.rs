@@ -92,7 +92,7 @@ pub fn scan_leftovers_for_app(hint: &AppLeftoverHint, cancel: &AtomicBool) -> Ve
             .cmp(&confidence_rank(a.confidence))
             .then_with(|| b.size_hint.cmp(&a.size_hint))
     });
-    hits.truncate(40);
+    hits.truncate(80);
     hits
 }
 

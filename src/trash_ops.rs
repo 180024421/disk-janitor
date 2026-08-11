@@ -1,8 +1,9 @@
-//! 删除：优先进回收站；可选允许永久删除兜底；回收站清空
+//! 删除：优先进回收站；可选允许永久删除兜底；安全粉碎；回收站清空
 
 use crate::model::is_sensitive_path;
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -13,18 +14,23 @@ pub struct TrashResult {
     /// 走了「直接删除」而非回收站的数量
     pub permanent: u64,
     pub skipped_locked: u64,
+    /// 安全粉碎的文件数
+    pub shredded: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct DeleteOptions {
     /// 回收站失败时是否允许直接删除
     pub allow_permanent: bool,
+    /// 安全粉碎（仅文件：覆写后永久删除，不可进回收站）
+    pub shred: bool,
 }
 
 impl Default for DeleteOptions {
     fn default() -> Self {
         Self {
             allow_permanent: false,
+            shred: false,
         }
     }
 }
@@ -38,6 +44,24 @@ pub fn move_to_trash_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashResult
     for p in paths {
         if !p.exists() {
             res.ok.push(p.clone());
+            continue;
+        }
+        if opts.shred {
+            if p.is_file() {
+                match shred_file(p, 3) {
+                    Ok(()) => {
+                        res.ok.push(p.clone());
+                        res.shredded += 1;
+                        res.permanent += 1;
+                    }
+                    Err(e) => res.failed.push((p.clone(), e)),
+                }
+            } else {
+                res.failed.push((
+                    p.clone(),
+                    "安全粉碎仅支持文件（目录请先展开或改用不粉碎删除）".into(),
+                ));
+            }
             continue;
         }
         match delete_with_fallback(p, opts.allow_permanent) {
@@ -57,6 +81,47 @@ pub fn move_to_trash_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashResult
         }
     }
     res
+}
+
+/// 覆写文件内容（零 / 伪随机）后永久删除。
+pub fn shred_file(path: &Path, passes: u8) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("不是普通文件".into());
+    }
+    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    let len = meta.len();
+    let passes = passes.max(1);
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 64 * 1024];
+        for pass in 0..passes {
+            f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            if pass % 2 == 0 {
+                buf.fill(0);
+            } else {
+                let mut x = (len ^ (pass as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    .wrapping_add(0xA5A5_5A5A);
+                for b in buf.iter_mut() {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1);
+                    *b = (x >> 33) as u8;
+                }
+            }
+            let mut remaining = len;
+            while remaining > 0 {
+                let n = remaining.min(buf.len() as u64) as usize;
+                f.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+                remaining -= n as u64;
+            }
+            f.flush().map_err(|e| e.to_string())?;
+        }
+    }
+    fs::remove_file(path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 enum DeleteOutcome {
@@ -137,7 +202,13 @@ fn trash_via_vb(path: &Path) -> Result<(), String> {
 }
 
 pub fn clean_junk_paths(paths: &[PathBuf]) -> TrashResult {
-    clean_junk_paths_with(paths, DeleteOptions { allow_permanent: true })
+    clean_junk_paths_with(
+        paths,
+        DeleteOptions {
+            allow_permanent: true,
+            shred: false,
+        },
+    )
 }
 
 pub fn clean_junk_paths_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashResult {
@@ -154,7 +225,18 @@ pub fn clean_junk_paths_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashRes
             continue;
         }
         if p.is_file() {
-            apply_outcome(delete_with_fallback(&p, opts.allow_permanent), &p, &mut res);
+            if opts.shred {
+                match shred_file(&p, 3) {
+                    Ok(()) => {
+                        res.ok.push(p.clone());
+                        res.shredded += 1;
+                        res.permanent += 1;
+                    }
+                    Err(e) => res.failed.push((p, e)),
+                }
+            } else {
+                apply_outcome(delete_with_fallback(&p, opts.allow_permanent), &p, &mut res);
+            }
             continue;
         }
         if p.is_dir() {
@@ -232,6 +314,9 @@ pub fn format_trash_errors(res: &TrashResult, limit: usize) -> String {
             "跳过占用中约 {} 个（关闭 WSL/程序后可再删）",
             res.skipped_locked
         ));
+    }
+    if res.shredded > 0 {
+        lines.push(format!("已安全粉碎 {} 个文件", res.shredded));
     }
     if res.permanent > 0 {
         lines.push(format!(
@@ -327,8 +412,17 @@ mod tests {
 
     #[test]
     fn no_permanent_without_flag() {
-        // 构造无法进回收站的场景较难；至少 API 默认 allow_permanent=false
         let opts = DeleteOptions::default();
         assert!(!opts.allow_permanent);
+        assert!(!opts.shred);
+    }
+
+    #[test]
+    fn shred_overwrites_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secret.bin");
+        fs::write(&f, b"TOPSECRETDATA123").unwrap();
+        shred_file(&f, 2).unwrap();
+        assert!(!f.exists());
     }
 }

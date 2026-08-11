@@ -1,4 +1,4 @@
-# 磁盘管家 — 远程更新（对齐 DeskReader / jiaoben）
+# 大帅清理器 — 远程更新（对齐 DeskReader / jiaoben）
 
 与 Reader 相同：配置 **服务器根地址**，客户端三源择优；本机额外支持 **自动下载热替换**，可选 **SHA256** 校验。
 
@@ -24,7 +24,7 @@
   "desktopUrl": "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-0.3.0.exe",
   "sha256": "可选：小写 hex，下载后校验，失败则拒绝安装",
   "changelog": "0.3.0 总览/重复/工具箱等",
-  "displayName": "磁盘管家",
+  "displayName": "大帅清理器",
   "enabled": true
 }
 ```

@@ -1,0 +1,16 @@
+; 资源管理器右键「用大帅清理器分析」示例。
+; 导入前请把路径改成实际安装目录中的 大帅清理器.exe 或 disk-janitor.exe。
+
+[HKEY_CLASSES_ROOT\Directory\shell\DashuaiCleaner]
+@="用大帅清理器分析"
+"Icon"="C:\\Program Files\\大帅清理器\\大帅清理器.exe"
+
+[HKEY_CLASSES_ROOT\Directory\shell\DashuaiCleaner\command]
+@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%1\""
+
+[HKEY_CLASSES_ROOT\Directory\Background\shell\DashuaiCleaner]
+@="用大帅清理器分析"
+"Icon"="C:\\Program Files\\大帅清理器\\大帅清理器.exe"
+
+[HKEY_CLASSES_ROOT\Directory\Background\shell\DashuaiCleaner\command]
+@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%V\""

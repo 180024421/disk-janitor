@@ -1,25 +1,67 @@
 //! 文件系统扫描结果模型
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone)]
+mod mtime_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S>(t: &Option<SystemTime>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let v = t
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        Option::<u64>::serialize(&v, s)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = Option::<u64>::deserialize(d)?;
+        Ok(v.map(|secs| UNIX_EPOCH + Duration::from_secs(secs)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsEntry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
     /// 文件：自身大小；目录：下属文件合计
     pub size: u64,
+    #[serde(default, with = "mtime_serde")]
     pub mtime: Option<SystemTime>,
+    /// 因大目录策略未展开，仅估算占用
+    #[serde(default)]
+    pub count_only: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+impl Default for FsEntry {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            name: String::new(),
+            is_dir: false,
+            size: 0,
+            mtime: None,
+            count_only: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanIndex {
     pub root: PathBuf,
     /// 规范化路径字符串 -> 条目
     pub entries: HashMap<String, FsEntry>,
     /// 父路径(小写) -> 子条目 key 列表（避免每次 O(全表) 找子项）
+    #[serde(skip)]
     pub children: HashMap<String, Vec<String>>,
     pub skipped: u64,
     /// 因跳过深入扫描而估算计入的字节（node_modules 等）
@@ -31,6 +73,9 @@ pub struct ScanIndex {
     pub errors: Vec<String>,
     /// 扫描是否仍在进行（增量快照时为 true）
     pub partial: bool,
+    /// 取消时尚未扫描的目录（用于断点续扫）
+    #[serde(default)]
+    pub resume_stack: Vec<PathBuf>,
 }
 
 impl ScanIndex {
