@@ -26,31 +26,58 @@ impl ScanOptions {
     }
 }
 
-/// 路径是否命中排除前缀（大小写不敏感）。
-pub fn path_is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
-    if excludes.is_empty() {
-        return false;
+/// 预规范化的排除前缀集合：构建一次，热路径只做字符串比较（大小写不敏感）。
+#[derive(Debug, Clone, Default)]
+pub struct ExcludeSet {
+    /// 小写、`\` 分隔、无尾斜杠的前缀
+    prefixes: Vec<String>,
+}
+
+impl ExcludeSet {
+    pub fn new(excludes: &[PathBuf]) -> Self {
+        let prefixes = excludes
+            .iter()
+            .filter_map(|ex| {
+                let mut ek = ex
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .replace('/', "\\");
+                while ek.ends_with('\\') {
+                    ek.pop();
+                }
+                // 盘符根「c:」补回反斜杠语义由 contains 统一处理
+                if ek.is_empty() {
+                    None
+                } else {
+                    Some(ek)
+                }
+            })
+            .collect();
+        Self { prefixes }
     }
-    let key = path
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .replace('/', "\\");
-    for ex in excludes {
-        let mut ek = ex
+
+    pub fn contains(&self, path: &Path) -> bool {
+        if self.prefixes.is_empty() {
+            return false;
+        }
+        let mut key = path
             .to_string_lossy()
             .to_ascii_lowercase()
             .replace('/', "\\");
-        while ek.ends_with('\\') {
-            ek.pop();
+        while key.ends_with('\\') {
+            key.pop();
         }
-        if ek.is_empty() {
-            continue;
-        }
-        if key == ek || key.starts_with(&format!("{ek}\\")) {
-            return true;
-        }
+        self.prefixes.iter().any(|ek| {
+            key.len() >= ek.len()
+                && key.starts_with(ek.as_str())
+                && (key.len() == ek.len() || key.as_bytes()[ek.len()] == b'\\')
+        })
     }
-    false
+}
+
+/// 路径是否命中排除前缀（大小写不敏感）。
+pub fn path_is_excluded(path: &Path, excludes: &[PathBuf]) -> bool {
+    ExcludeSet::new(excludes).contains(path)
 }
 
 #[derive(Debug, Clone)]
@@ -445,7 +472,7 @@ where
     let mut last_partial = Instant::now();
     let quick_lim = opts.quick_limit();
     let turbo = opts.turbo;
-    let excludes = opts.excludes.clone();
+    let excludes = ExcludeSet::new(&opts.excludes);
 
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
@@ -477,7 +504,7 @@ where
             return done;
         }
 
-        if path_is_excluded(&dir, &excludes) {
+        if excludes.contains(&dir) {
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -502,7 +529,7 @@ where
                 if cancel.load(Ordering::Relaxed) {
                     return None;
                 }
-                if path_is_excluded(path, excludes_ref) {
+                if excludes_ref.contains(path) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
@@ -871,5 +898,17 @@ mod tests {
         let ex = vec![PathBuf::from(r"c:\users\foo")];
         assert!(path_is_excluded(&p, &ex));
         assert!(!path_is_excluded(&PathBuf::from(r"C:\Users\Other"), &ex));
+    }
+
+    #[test]
+    fn exclude_prefix_respects_path_boundary() {
+        let ex = vec![PathBuf::from(r"C:\Users\Foo")];
+        let set = ExcludeSet::new(&ex);
+        assert!(set.contains(Path::new(r"c:\users\foo")));
+        assert!(set.contains(Path::new(r"C:\Users\Foo\sub\a.txt")));
+        // 同前缀但不同目录不应命中
+        assert!(!set.contains(Path::new(r"C:\Users\FooBar")));
+        // 正斜杠也应规范化
+        assert!(set.contains(Path::new("C:/Users/Foo/x")));
     }
 }

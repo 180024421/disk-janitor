@@ -16,7 +16,7 @@ pub struct JunkRule {
     pub default_selected: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct JunkHit {
     pub rule_id: String,
@@ -605,14 +605,62 @@ pub fn safe_selected_size(hits: &[JunkHit]) -> u64 {
         .sum()
 }
 
-/// 仅保留非敏感且已勾选的项（用于安静清理）
+/// 仅保留安全白名单内、非敏感且已勾选的项（用于安静清理）。
+/// 与「一键安全清理」共用 `is_safe_rule`，避免规则默认勾选变化后计划任务误清。
 pub fn safe_junk_hits(hits: Vec<JunkHit>) -> Vec<JunkHit> {
     hits.into_iter()
-        .filter(|h| !h.sensitive && h.selected && h.size > 0)
+        .filter(|h| !h.sensitive && h.selected && h.size > 0 && is_safe_rule(&h.rule_id))
         .collect()
+}
+
+/// 用户排除列表同样约束清理（不只约束扫描）：过滤掉命中排除前缀的路径。
+pub fn filter_excluded_paths(paths: Vec<PathBuf>, excludes: &[String]) -> Vec<PathBuf> {
+    if excludes.is_empty() {
+        return paths;
+    }
+    let ex: Vec<PathBuf> = excludes.iter().map(PathBuf::from).collect();
+    let set = crate::scan::ExcludeSet::new(&ex);
+    paths.into_iter().filter(|p| !set.contains(p)).collect()
 }
 
 pub fn reclaimable_estimate(junk: &[JunkHit], dup_waste: u64) -> u64 {
     let junk_sz: u64 = junk.iter().filter(|h| h.selected).map(|h| h.size).sum();
     junk_sz.saturating_add(dup_waste)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_paths_are_filtered_from_clean() {
+        let paths = vec![
+            PathBuf::from(r"C:\Users\a\AppData\Local\Temp"),
+            PathBuf::from(r"D:\Keep\cache"),
+        ];
+        let excludes = vec![r"D:\Keep".to_string()];
+        let out = filter_excluded_paths(paths, &excludes);
+        assert_eq!(out, vec![PathBuf::from(r"C:\Users\a\AppData\Local\Temp")]);
+    }
+
+    #[test]
+    fn quiet_clean_only_takes_safe_rules() {
+        let mk = |id: &str, sensitive: bool, selected: bool| JunkHit {
+            rule_id: id.to_string(),
+            selected,
+            sensitive,
+            size: 100,
+            ..Default::default()
+        };
+        let hits = vec![
+            mk("user_temp", false, true),
+            // 非安全白名单规则即使被勾选也不进入安静清理
+            mk("windows_old", false, true),
+            mk("chrome_cache", true, true),
+            mk("edge_cache", false, false),
+        ];
+        let safe = safe_junk_hits(hits);
+        assert_eq!(safe.len(), 1);
+        assert_eq!(safe[0].rule_id, "user_temp");
+    }
 }

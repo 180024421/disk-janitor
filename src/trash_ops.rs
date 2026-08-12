@@ -89,6 +89,16 @@ pub fn shred_file(path: &Path, passes: u8) -> Result<(), String> {
         return Err("不是普通文件".into());
     }
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        let attrs = meta.file_attributes();
+        // 稀疏文件按逻辑大小覆写会把磁盘写满；重解析点可能指向别处
+        if attrs & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err("稀疏文件/重解析点不支持安全粉碎（请用普通删除）".into());
+        }
+    }
     let len = meta.len();
     let passes = passes.max(1);
     {

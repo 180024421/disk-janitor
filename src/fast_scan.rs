@@ -1,7 +1,7 @@
 //! 极速扫描：优先 NTFS MFT（需管理员），失败回退 turbo walk
 
 use crate::model::{FsEntry, ScanIndex};
-use crate::scan::{scan_path_ex, ScanEvent, ScanOptions, ScanProgress};
+use crate::scan::{scan_path_ex, ExcludeSet, ScanEvent, ScanOptions, ScanProgress};
 use ntfs_reader::file_info::{FileInfo, HashMapCache};
 use ntfs_reader::mft::Mft;
 use ntfs_reader::volume::Volume;
@@ -52,11 +52,7 @@ pub fn scan_mft_drive(
     })?;
     let mft = Mft::new(volume).map_err(|e| format!("读取 MFT 失败: {e}"))?;
 
-    let exclude_norm: Vec<String> = excludes
-        .iter()
-        .map(|p| p.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let exclude_set = ExcludeSet::new(excludes);
 
     let mut index = ScanIndex {
         root: root.clone(),
@@ -77,6 +73,7 @@ pub fn scan_mft_drive(
 
     let mut cache = HashMapCache::default();
     let mut visited = 0u64;
+    let mut total_bytes = 0u64;
     let mut last_ui = Instant::now();
     let mut dir_sizes: HashMap<String, u64> = HashMap::new();
 
@@ -105,7 +102,11 @@ pub fn scan_mft_drive(
             }
         }
 
-        if is_excluded(&path, &exclude_norm) {
+        // 与普通扫描的 Ignore 目录保持一致（回收站 / 卷影 / 脱机缓存）
+        if in_system_ignored_dir(&path) {
+            continue;
+        }
+        if exclude_set.contains(&path) {
             continue;
         }
 
@@ -131,6 +132,7 @@ pub fn scan_mft_drive(
         );
 
         if !info.is_directory && size > 0 {
+            total_bytes += size;
             for anc in path.ancestors().skip(1) {
                 if anc.as_os_str().is_empty() {
                     break;
@@ -145,7 +147,7 @@ pub fn scan_mft_drive(
             on_event(ScanEvent::Progress(ScanProgress {
                 visited,
                 skipped: 0,
-                bytes_seen: dir_sizes.values().sum(),
+                bytes_seen: total_bytes,
                 current: path.display().to_string(),
                 elapsed: started.elapsed(),
                 done: false,
@@ -206,17 +208,14 @@ pub fn scan_mft_drive(
     Ok(index)
 }
 
-fn is_excluded(path: &Path, excludes: &[String]) -> bool {
-    if excludes.is_empty() {
-        return false;
-    }
-    let s = path
-        .to_string_lossy()
-        .trim_end_matches(['\\', '/'])
-        .to_ascii_lowercase();
-    excludes
-        .iter()
-        .any(|ex| s == *ex || s.starts_with(&format!("{ex}\\")))
+/// 是否位于普通扫描会直接忽略的系统目录内（`$Recycle.Bin` 等）。
+fn in_system_ignored_dir(path: &Path) -> bool {
+    path.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy();
+        s.eq_ignore_ascii_case("$Recycle.Bin")
+            || s.eq_ignore_ascii_case("System Volume Information")
+            || s.eq_ignore_ascii_case("csc")
+    })
 }
 
 /// 盘符根且管理员时走 MFT，否则 turbo walk。
@@ -285,6 +284,14 @@ mod tests {
         let e = idx.get(&nm).expect("node_modules present");
         assert!(!e.count_only, "turbo should fully walk node_modules");
         assert_eq!(e.size, 1500);
+    }
+
+    #[test]
+    fn system_dirs_are_ignored_in_mft() {
+        assert!(in_system_ignored_dir(Path::new(r"C:\$Recycle.Bin\S-1-5-21\file")));
+        assert!(in_system_ignored_dir(Path::new(r"D:\System Volume Information\x")));
+        assert!(!in_system_ignored_dir(Path::new(r"C:\Users\a\Recycle.Bin.txt")));
+        assert!(!in_system_ignored_dir(Path::new(r"C:\Windows\Temp")));
     }
 
     #[test]

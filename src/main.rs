@@ -26,7 +26,7 @@ mod whitelist;
 
 use app::JanitorApp;
 use eframe::egui;
-use junk::{junk_selected_paths, safe_junk_hits, scan_junk};
+use junk::{filter_excluded_paths, junk_selected_paths, safe_junk_hits, scan_junk};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use trash_ops::clean_junk_paths;
@@ -81,9 +81,10 @@ fn parse_path_arg(args: &[String]) -> Option<PathBuf> {
 fn run_quiet_clean() {
     println!("disk-janitor --quiet-clean v{}", env!("CARGO_PKG_VERSION"));
     let cancel = AtomicBool::new(false);
+    let cfg = updater::AppConfig::load();
     let hits = scan_junk(&cancel);
     let safe = safe_junk_hits(hits);
-    let paths = junk_selected_paths(&safe);
+    let paths = filter_excluded_paths(junk_selected_paths(&safe), &cfg.exclude_paths);
     if paths.is_empty() {
         println!("无可清理的安全垃圾项。");
         return;

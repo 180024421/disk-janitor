@@ -215,13 +215,13 @@ pub fn find_duplicates(
             by_hash
                 .into_iter()
                 .filter(|(_, v)| v.len() >= 2)
-                .flat_map(|(hash, paths)| {
+                .flat_map(|(_hash, paths)| {
+                    // 只有完整哈希一致才算重复；读不了完整内容的文件直接丢弃，
+                    // 绝不用抽样哈希（仅前 64KB）确认重复，否则可能误删。
                     let mut confirmed: HashMap<String, Vec<PathBuf>> = HashMap::new();
                     for p in paths {
                         if let Some(full) = file_hash_full(&p) {
                             confirmed.entry(full).or_default().push(p);
-                        } else {
-                            confirmed.entry(hash.clone()).or_default().push(p);
                         }
                     }
                     confirmed

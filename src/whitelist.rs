@@ -41,9 +41,15 @@ impl LeftoverWhitelist {
         self.paths.iter().map(|p| norm_key(Path::new(p))).collect()
     }
 
+    /// 命中即白名单：完全相等，或位于某白名单目录之下（前缀匹配）。
     pub fn contains(&self, path: &Path) -> bool {
         let key = norm_key(path);
-        self.paths.iter().any(|p| p == &key)
+        self.paths.iter().any(|p| {
+            key == *p
+                || (key.len() > p.len()
+                    && key.starts_with(p.as_str())
+                    && key.as_bytes()[p.len()] == b'\\')
+        })
     }
 
     pub fn add(&mut self, path: &Path) -> bool {
@@ -77,4 +83,20 @@ fn norm_key(path: &Path) -> String {
     path.to_string_lossy()
         .trim_end_matches(['\\', '/'])
         .to_ascii_lowercase()
+        .replace('/', "\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitelist_prefix_matches_children() {
+        let mut wl = LeftoverWhitelist::default();
+        assert!(wl.add(Path::new(r"D:\Apps\Foo")));
+        assert!(wl.contains(Path::new(r"d:\apps\foo")));
+        assert!(wl.contains(Path::new(r"D:\Apps\Foo\bar\baz.txt")));
+        assert!(!wl.contains(Path::new(r"D:\Apps\FooBar")));
+        assert!(!wl.contains(Path::new(r"D:\Apps\Other")));
+    }
 }

@@ -182,8 +182,11 @@ pub fn expand_env(s: &str) -> String {
                 }
             }
         }
-        out.push(s[i..].chars().next().unwrap());
-        i += s[i..].chars().next().unwrap().len_utf8();
+        let Some(c) = s[i..].chars().next() else {
+            break;
+        };
+        out.push(c);
+        i += c.len_utf8();
     }
     out
 }

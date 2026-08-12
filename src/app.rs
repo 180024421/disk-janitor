@@ -17,8 +17,8 @@ use crate::export::{
 use crate::fast_scan;
 use crate::file_types::{filter_files, FileKind};
 use crate::junk::{
-    apply_safe_selection, junk_selected_paths, reclaimable_estimate, safe_junk_hits,
-    safe_selected_size, scan_junk, JunkHit,
+    apply_safe_selection, filter_excluded_paths, junk_selected_paths, reclaimable_estimate,
+    safe_junk_hits, safe_selected_size, scan_junk, JunkHit,
 };
 use crate::leftovers::{
     scan_leftovers, scan_leftovers_for_app, AppLeftoverHint, Confidence, LeftoverHit,
@@ -40,8 +40,9 @@ use crate::startup::{
 };
 use crate::theme::{self, ACCENT, DANGER, MUTED, OK, WARN};
 use crate::trash_ops::{
-    any_sensitive, clean_junk_paths, empty_recycle_bin, format_trash_errors, move_to_trash,
-    move_to_trash_with, recycle_bin_size, DeleteOptions, TrashResult,
+    any_sensitive, clean_junk_paths, clean_junk_paths_with, empty_recycle_bin,
+    format_trash_errors, move_to_trash, move_to_trash_with, recycle_bin_size, DeleteOptions,
+    TrashResult,
 };
 use crate::updater::{
     check_update, download_and_apply, open_url, AppConfig, UpdateCheck, APP_VERSION_CODE,
@@ -93,12 +94,21 @@ enum WorkerMsg {
     AppxDone(Vec<AppxPackage>),
 }
 
+/// 「最大占用」页缓存（索引变更时失效，避免每帧全表排序）
+#[derive(Clone, Default)]
+struct TopnCache {
+    dirs: Vec<FsEntry>,
+    files: Vec<FsEntry>,
+    empty: Vec<FsEntry>,
+}
+
 pub struct JanitorApp {
     drives: Vec<PathBuf>,
     drive_infos: Vec<DriveInfo>,
     root_input: String,
     current_dir: PathBuf,
     index: Option<ScanIndex>,
+    topn_cache: Option<TopnCache>,
     sort_key: SortKey,
     sort_dir: SortDir,
     filter: String,
@@ -120,6 +130,10 @@ pub struct JanitorApp {
     junk_scanning: bool,
     junk_cleaning: bool,
     confirm_junk: bool,
+    /// 垃圾清理：回收站失败时是否允许直接删除（确认框可关）
+    junk_allow_permanent: bool,
+    /// 垃圾清理确认框打开期间缓存的待清路径（避免每帧 canonicalize）
+    junk_confirm_paths: Option<Vec<PathBuf>>,
     apps: Vec<InstalledApp>,
     app_filter: String,
     apps_loading: bool,
@@ -199,6 +213,7 @@ impl Default for JanitorApp {
             root_input: start.display().to_string(),
             current_dir: start,
             index: None,
+            topn_cache: None,
             sort_key: SortKey::Size,
             sort_dir: SortDir::Desc,
             filter: String::new(),
@@ -221,6 +236,8 @@ impl Default for JanitorApp {
             junk_scanning: false,
             junk_cleaning: false,
             confirm_junk: false,
+            junk_allow_permanent: true,
+            junk_confirm_paths: None,
             apps: Vec::new(),
             app_filter: String::new(),
             apps_loading: false,
@@ -733,6 +750,7 @@ impl JanitorApp {
                     let remaining: Vec<PathBuf> =
                         cp.remaining.iter().map(PathBuf::from).collect();
                     self.index = Some(base.clone());
+                    self.topn_cache = None;
                     self.start_resume_scan(PathBuf::from(root), base, remaining);
                     return;
                 }
@@ -826,11 +844,12 @@ impl JanitorApp {
         self.rx = Some(rx);
         self.junk_cleaning = true;
         self.status = "启动时安静清理安全垃圾…".into();
+        let excludes = self.config.exclude_paths.clone();
         let handle = std::thread::spawn(move || {
             let cancel = AtomicBool::new(false);
             let hits = scan_junk(&cancel);
             let safe = safe_junk_hits(hits);
-            let paths = junk_selected_paths(&safe);
+            let paths = filter_excluded_paths(junk_selected_paths(&safe), &excludes);
             let res = if paths.is_empty() {
                 TrashResult::default()
             } else {
@@ -884,6 +903,7 @@ impl JanitorApp {
             if let Some(idx) = partial {
                 let keep = self.current_dir.clone();
                 self.index = Some(idx);
+                self.topn_cache = None;
                 if let Some(i) = &self.index {
                     if i.get(&keep).is_some() {
                         self.current_dir = keep;
@@ -1026,6 +1046,7 @@ impl JanitorApp {
                         self.current_dir = root;
                     }
                     self.index = Some(idx);
+                    self.topn_cache = None;
                     self.progress = None;
                     self.rx = None;
                     if was_expand.is_none() && !cancelled {
@@ -1324,6 +1345,9 @@ impl JanitorApp {
 
     fn apply_delete_result(&mut self, res: TrashResult) {
         self.deleting = false;
+        if !res.ok.is_empty() {
+            self.topn_cache = None;
+        }
         for p in &res.ok {
             let key = ScanIndex::key(p);
             self.selected.remove(&key);
@@ -1408,12 +1432,16 @@ impl JanitorApp {
     }
 
     fn do_junk_clean(&mut self) {
-        let paths = junk_selected_paths(&self.junk_hits);
+        let paths = filter_excluded_paths(
+            junk_selected_paths(&self.junk_hits),
+            &self.config.exclude_paths,
+        );
         if paths.is_empty() || self.busy() {
             return;
         }
         self.confirm_junk = false;
         self.confirm_safe_clean = false;
+        self.junk_confirm_paths = None;
         self.junk_cleaning = true;
         self.last_error.clear();
         self.status = format!(
@@ -1422,8 +1450,12 @@ impl JanitorApp {
         );
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
+        let opts = DeleteOptions {
+            allow_permanent: self.junk_allow_permanent,
+            shred: false,
+        };
         let handle = std::thread::spawn(move || {
-            let res = clean_junk_paths(&paths);
+            let res = clean_junk_paths_with(&paths, opts);
             let _ = tx.send(WorkerMsg::JunkCleanDone(res));
         });
         self._worker = Some(handle);
@@ -2093,6 +2125,7 @@ impl eframe::App for JanitorApp {
                         )
                         .clicked()
                     {
+                        self.junk_confirm_paths = None;
                         self.confirm_junk = true;
                     }
                     if self.junk_cleaning {
@@ -2276,6 +2309,7 @@ impl JanitorApp {
                                 if junk_selected_paths(&self.junk_hits).is_empty() {
                                     self.status = "当前没有可安全清理的项".into();
                                 } else {
+                                    self.junk_confirm_paths = None;
                                     self.confirm_safe_clean = true;
                                 }
                             }
@@ -2412,7 +2446,15 @@ impl JanitorApp {
                 if ui.button("⬆ 上级").clicked() {
                     if let Some(p) = self.current_dir.parent() {
                         if let Some(idx) = &self.index {
-                            if p.starts_with(&idx.root) || *p == idx.root {
+                            // Path::starts_with 区分大小写，Windows 路径须规范化后比较
+                            let root_key = ScanIndex::key_norm(&idx.root);
+                            let p_key = ScanIndex::key_norm(p);
+                            let root_pref = if root_key.ends_with('\\') {
+                                root_key.clone()
+                            } else {
+                                format!("{root_key}\\")
+                            };
+                            if p_key == root_key || p_key.starts_with(&root_pref) {
                                 self.current_dir = p.to_path_buf();
                             }
                         }
@@ -2484,27 +2526,33 @@ impl JanitorApp {
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
-                let Some(idx) = self.index.clone() else {
+                if self.index.is_none() {
                     theme::section_title(ui, "最大占用", "请先扫描一个路径");
                     return;
-                };
+                }
+                if self.topn_cache.is_none() {
+                    let idx = self.index.as_ref().expect("index checked above");
+                    self.topn_cache = Some(TopnCache {
+                        dirs: idx.top_by_size(true, 40).into_iter().cloned().collect(),
+                        files: idx.top_by_size(false, 40).into_iter().cloned().collect(),
+                        empty: idx.empty_dirs(80).into_iter().cloned().collect(),
+                    });
+                }
+                let cache = self.topn_cache.clone().unwrap_or_default();
                 theme::section_title(ui, "最大占用", "按体积排序的热点，便于快速下手清理。");
                 ui.heading(
                     egui::RichText::new("最大的文件夹（Top 40）")
                         .color(ACCENT)
                         .size(15.0),
                 );
-                let dirs: Vec<FsEntry> = idx.top_by_size(true, 40).into_iter().cloned().collect();
-                self.ui_entry_list(ui, dirs);
+                self.ui_entry_list(ui, cache.dirs);
                 ui.add_space(12.0);
                 ui.heading(
                     egui::RichText::new("最大的文件（Top 40）")
                         .color(ACCENT)
                         .size(15.0),
                 );
-                let files: Vec<FsEntry> =
-                    idx.top_by_size(false, 40).into_iter().cloned().collect();
-                self.ui_entry_list(ui, files);
+                self.ui_entry_list(ui, cache.files);
                 ui.add_space(12.0);
                 ui.heading(
                     egui::RichText::new("空文件夹（最多 80）")
@@ -2514,7 +2562,7 @@ impl JanitorApp {
                 ui.label(
                     egui::RichText::new("占用为 0 的目录，可勾选后移到回收站。").color(MUTED),
                 );
-                let empty: Vec<FsEntry> = idx.empty_dirs(80).into_iter().cloned().collect();
+                let empty = cache.empty;
                 if empty.is_empty() {
                     ui.label("未发现空文件夹");
                 } else {
@@ -2620,6 +2668,7 @@ impl JanitorApp {
                     if junk_selected_paths(&self.junk_hits).is_empty() {
                         self.status = "当前没有可安全清理的项".into();
                     } else {
+                        self.junk_confirm_paths = None;
                         self.confirm_safe_clean = true;
                     }
                 }
@@ -4042,7 +4091,16 @@ impl JanitorApp {
                 });
         }
         if self.confirm_junk || self.confirm_safe_clean {
-            let paths = junk_selected_paths(&self.junk_hits);
+            // 打开期间只算一次（canonicalize 可能较慢），选择变化时在开框处清缓存
+            let paths = self
+                .junk_confirm_paths
+                .get_or_insert_with(|| {
+                    filter_excluded_paths(
+                        junk_selected_paths(&self.junk_hits),
+                        &self.config.exclude_paths,
+                    )
+                })
+                .clone();
             let sensitive = any_sensitive(&paths);
             let sz: u64 = self
                 .junk_hits
@@ -4068,7 +4126,11 @@ impl JanitorApp {
                         paths.len(),
                         format_bytes(sz)
                     ));
-                    ui.label("优先进回收站；进不去则直接删除。正在使用的文件会跳过。");
+                    ui.label("优先进回收站；正在使用的文件会跳过。");
+                    ui.checkbox(
+                        &mut self.junk_allow_permanent,
+                        "回收站放不进去时允许直接删除（不可恢复）",
+                    );
                     ui.group(|ui| {
                         ui.weak("将清理：");
                         ui.monospace(&preview);
@@ -4083,6 +4145,7 @@ impl JanitorApp {
                         if ui.button("取消").clicked() {
                             self.confirm_junk = false;
                             self.confirm_safe_clean = false;
+                            self.junk_confirm_paths = None;
                         }
                         if ui.button("开始清理").clicked() {
                             self.do_junk_clean();
