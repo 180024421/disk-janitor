@@ -1,9 +1,9 @@
 {
-    "versionCode":  700,
-    "versionName":  "0.7.0",
-    "desktopUrl":  "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-0.7.0.exe",
-    "sha256":  "c307381d87dc65879b7d316cf783cd07e5dd7d4a0c9fdd321cfdcccd039a6d08",
-    "changelog":  "大帅清理器 0.7.0 #700",
-    "displayName":  "大帅清理器",
-    "enabled":  true
+  "versionCode": 700,
+  "versionName": "0.7.0",
+  "desktopUrl": "https://1ph1hf8043323.vicp.fun/api/files/app-update/disk-janitor/DiskJanitor-0.7.0.exe",
+  "sha256": "c307381d87dc65879b7d316cf783cd07e5dd7d4a0c9fdd321cfdcccd039a6d08",
+  "changelog": "大帅清理器 0.7.0 #700",
+  "displayName": "大帅清理器",
+  "enabled": true
 }

@@ -4,7 +4,7 @@
 
 ## 默认
 
-- 根地址：`http://111.229.202.251:8687`
+- 根地址：`https://1ph1hf8043323.vicp.fun`（花生壳 HTTPS → Nginx → jiaoben，与 DeskReader 一致）
 - appKey：`disk-janitor`
 
 ## 探测 URL
@@ -21,7 +21,7 @@
 {
   "versionCode": 4,
   "versionName": "0.3.0",
-  "desktopUrl": "http://111.229.202.251:8687/disk-janitor/releases/DiskJanitor-0.3.0.exe",
+  "desktopUrl": "https://1ph1hf8043323.vicp.fun/api/files/app-update/disk-janitor/DiskJanitor-0.3.0.exe",
   "sha256": "可选：小写 hex，下载后校验，失败则拒绝安装",
   "changelog": "0.3.0 总览/重复/工具箱等",
   "displayName": "大帅清理器",

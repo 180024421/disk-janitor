@@ -7,3 +7,7 @@
 *.pdb
 .idea/
 .vscode/
+
+# 本地编译工具链（勿提交）
+.tools/
+

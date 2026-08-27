@@ -9,7 +9,31 @@ use std::process::Command;
 pub const APP_VERSION_NAME: &str = env!("CARGO_PKG_VERSION");
 include!(concat!(env!("OUT_DIR"), "/version_code.rs"));
 pub const APP_KEY: &str = "disk-janitor";
-pub const DEFAULT_API_BASE: &str = "http://111.229.202.251:8687";
+/// 与 DeskReader 一致：花生壳 HTTPS → Nginx → jiaoben（勿带 :8687）
+pub const DEFAULT_API_BASE: &str = "https://1ph1hf8043323.vicp.fun";
+
+/// 历史占位 / 直连 IP:8687 → 统一到花生壳域名
+pub fn rewrite_public_host(url: &str) -> String {
+    let mut u = url.trim().to_string();
+    if u.is_empty() {
+        return u;
+    }
+    u = u.replace("YOUR_SERVER_IP", "1ph1hf8043323.vicp.fun");
+    for old in [
+        "http://111.229.202.251:8687",
+        "https://111.229.202.251:8687",
+        "http://111.229.202.251",
+        "https://111.229.202.251",
+        "http://1ph1hf8043323.vicp.fun:8687",
+        "https://1ph1hf8043323.vicp.fun:8687",
+    ] {
+        u = u.replace(old, DEFAULT_API_BASE);
+    }
+    if u.starts_with("http://1ph1hf8043323.vicp.fun") {
+        u = u.replacen("http://", "https://", 1);
+    }
+    u
+}
 
 #[derive(Debug, Clone)]
 pub struct RemoteManifest {
@@ -174,7 +198,7 @@ impl AppConfig {
         if self.schedule_time.trim().is_empty() {
             self.schedule_time = "03:00".into();
         }
-        let mut base = self.update_api_base.trim().to_string();
+        let mut base = rewrite_public_host(&self.update_api_base);
         if base.is_empty() || base.contains("YOUR_SERVER") {
             self.update_api_base = DEFAULT_API_BASE.to_string();
             return;
@@ -239,10 +263,11 @@ pub fn check_update(api_base: &str) -> UpdateCheck {
 }
 
 fn candidate_urls(base: &str) -> [String; 3] {
+    // jiaoben 公开 API 优先（与 DeskReader 一致）；静态 json / 旧路径仅作兜底
     [
+        format!("{base}/api/app-update/{APP_KEY}"),
         format!("{base}/{APP_KEY}/app-update.json"),
         format!("{base}/api/{APP_KEY}/app-update"),
-        format!("{base}/api/app-update/{APP_KEY}"),
     ]
 }
 
@@ -268,20 +293,24 @@ fn fetch_best_update(base: &str) -> Result<Option<RemoteManifest>, String> {
 }
 
 fn fetch_one(url: &str) -> Result<Option<RemoteManifest>, String> {
-    let resp = ureq::get(url)
+    let resp = match ureq::get(url)
         .set(
             "User-Agent",
             concat!("disk-janitor/", env!("CARGO_PKG_VERSION")),
         )
         .set("Accept", "application/json")
         .call()
-        .map_err(|e| format!("网络错误({url}): {e}"))?;
-    if !(200..300).contains(&resp.status()) {
-        return Ok(None);
-    }
-    let v: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("解析 JSON 失败({url}): {e}"))?;
+    {
+        Ok(r) if (200..300).contains(&r.status()) => r,
+        Ok(_) | Err(ureq::Error::Status(404, _)) | Err(ureq::Error::Status(403, _)) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("网络错误({url}): {e}")),
+    };
+    let v: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
     let payload = if v.get("data").is_some() {
         &v["data"]
     } else {
@@ -309,15 +338,15 @@ fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
             _ => None,
         })
         .unwrap_or_default();
-    let url = v
-        .get("desktopUrl")
-        .or_else(|| v.get("desktopSetupUrl"))
-        .or_else(|| v.get("desktopPortableUrl"))
-        .or_else(|| v.get("url"))
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
+    let url = rewrite_public_host(
+        v.get("desktopUrl")
+            .or_else(|| v.get("desktopSetupUrl"))
+            .or_else(|| v.get("desktopPortableUrl"))
+            .or_else(|| v.get("url"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim(),
+    );
     let changelog = v
         .get("changelog")
         .and_then(|x| x.as_str())
@@ -550,10 +579,31 @@ mod tests {
 
     #[test]
     fn candidate_urls_match_reader_shape() {
-        let u = candidate_urls("http://host:8687");
-        assert_eq!(u[0], "http://host:8687/disk-janitor/app-update.json");
-        assert_eq!(u[1], "http://host:8687/api/disk-janitor/app-update");
-        assert_eq!(u[2], "http://host:8687/api/app-update/disk-janitor");
+        let u = candidate_urls("https://1ph1hf8043323.vicp.fun");
+        assert_eq!(
+            u[0],
+            "https://1ph1hf8043323.vicp.fun/api/app-update/disk-janitor"
+        );
+        assert_eq!(
+            u[1],
+            "https://1ph1hf8043323.vicp.fun/disk-janitor/app-update.json"
+        );
+        assert_eq!(
+            u[2],
+            "https://1ph1hf8043323.vicp.fun/api/disk-janitor/app-update"
+        );
+    }
+
+    #[test]
+    fn rewrite_old_ip_to_vicp_fun() {
+        assert_eq!(
+            rewrite_public_host("http://111.229.202.251:8687"),
+            DEFAULT_API_BASE
+        );
+        assert_eq!(
+            rewrite_public_host("http://1ph1hf8043323.vicp.fun:8687/dl/a.exe"),
+            "https://1ph1hf8043323.vicp.fun/dl/a.exe"
+        );
     }
 
     #[test]
