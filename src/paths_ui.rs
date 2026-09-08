@@ -52,6 +52,27 @@ pub fn open_recycle_bin() -> Result<(), String> {
     Ok(())
 }
 
+pub fn open_storage_settings() -> Result<(), String> {
+    let output = Command::new("cmd")
+        .args(["/D", "/C", "start", "", "ms-settings:storagesense"])
+        .output()
+        .map_err(|e| format!("无法启动 Windows 设置：{e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(format!(
+            "Windows 存储设置启动失败（{}）：{} {}",
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        )
+        .trim()
+        .to_string())
+    }
+}
+
 pub fn preview_paths(paths: &[PathBuf], limit: usize) -> String {
     let mut lines: Vec<String> = paths
         .iter()

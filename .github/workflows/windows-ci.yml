@@ -1,0 +1,58 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, test, build
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-ci
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        if: always()
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # These tests intentionally do not run probes that inspect the runner's
+      # real disks/registry, or tests that put files into the real Recycle Bin.
+      - name: Run sandbox-safe tests
+        if: always()
+        run: >-
+          cargo test --locked --
+          --skip trash_ops::tests::trash_moves_file
+          --skip trash_ops::tests::clean_junk_contents_keeps_root
+          --skip startup::tests::list_runs
+          --skip orphans::tests::scan_runs
+          --skip fast_scan::tests::mft_without_admin_errors_or_ok
+          --skip leftovers::tests::scan_broad_does_not_panic
+          --skip leftovers::tests::followup_with_empty_hint
+          --skip shortcuts::tests::scan_finishes_quickly
+
+      - name: Build release
+        if: always()
+        run: cargo build --release --locked

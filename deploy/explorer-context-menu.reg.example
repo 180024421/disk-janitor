@@ -6,11 +6,18 @@
 "Icon"="C:\\Program Files\\大帅清理器\\大帅清理器.exe"
 
 [HKEY_CLASSES_ROOT\Directory\shell\DashuaiCleaner\command]
-@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%1\""
+@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%1\" --scan"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\DashuaiCleaner]
 @="用大帅清理器分析"
 "Icon"="C:\\Program Files\\大帅清理器\\大帅清理器.exe"
 
 [HKEY_CLASSES_ROOT\Directory\Background\shell\DashuaiCleaner\command]
-@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%V\""
+@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%V\" --scan"
+
+[HKEY_CLASSES_ROOT\Drive\shell\DashuaiCleaner]
+@="用大帅清理器分析"
+"Icon"="C:\\Program Files\\大帅清理器\\大帅清理器.exe"
+
+[HKEY_CLASSES_ROOT\Drive\shell\DashuaiCleaner\command]
+@="\"C:\\Program Files\\大帅清理器\\大帅清理器.exe\" --path \"%1\" --scan"

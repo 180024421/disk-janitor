@@ -78,7 +78,9 @@ fn scan_dir_flat(
         let path = ent.path();
         if path.is_dir() {
             // 开始菜单：多扫一层
-            if location.eq_ignore_ascii_case("Programs") || dir.to_string_lossy().contains("Start Menu") {
+            if location.eq_ignore_ascii_case("Programs")
+                || dir.to_string_lossy().contains("Start Menu")
+            {
                 subdirs.push(path);
             }
             continue;
@@ -208,12 +210,7 @@ fn local_fixed_letters() -> Vec<u8> {
             continue;
         }
         let letter = b'A' + i;
-        let mut root = [
-            u16::from(letter),
-            u16::from(b':'),
-            u16::from(b'\\'),
-            0,
-        ];
+        let mut root = [u16::from(letter), u16::from(b':'), u16::from(b'\\'), 0];
         let dtype = unsafe { GetDriveTypeW(root.as_mut_ptr()) };
         if matches!(
             dtype,
@@ -240,8 +237,11 @@ fn read_lnk_local_path(path: &Path) -> Option<String> {
 
     // HasLinkTargetIDList
     if flags & 0x01 != 0 {
-        let id_len = u16::from_le_bytes(data.get(cursor as usize..cursor as usize + 2)?.try_into().ok()?)
-            as u32;
+        let id_len = u16::from_le_bytes(
+            data.get(cursor as usize..cursor as usize + 2)?
+                .try_into()
+                .ok()?,
+        ) as u32;
         cursor = cursor.checked_add(2)?.checked_add(id_len)?;
     }
 

@@ -1,6 +1,6 @@
 //! 极速扫描：优先 NTFS MFT（需管理员），失败回退 turbo walk
 
-use crate::model::{FsEntry, ScanIndex};
+use crate::model::{EstimateQuality, FsEntry, ScanIndex};
 use crate::scan::{scan_path_ex, ExcludeSet, ScanEvent, ScanOptions, ScanProgress};
 use ntfs_reader::file_info::{FileInfo, HashMapCache};
 use ntfs_reader::mft::Mft;
@@ -47,9 +47,8 @@ pub fn scan_mft_drive(
     let vol_path = format!("\\\\.\\{letter}:");
     let started = Instant::now();
 
-    let volume = Volume::new(&vol_path).map_err(|e| {
-        format!("打开卷失败（通常需要管理员权限）: {e}")
-    })?;
+    let volume =
+        Volume::new(&vol_path).map_err(|e| format!("打开卷失败（通常需要管理员权限）: {e}"))?;
     let mft = Mft::new(volume).map_err(|e| format!("读取 MFT 失败: {e}"))?;
 
     let exclude_set = ExcludeSet::new(excludes);
@@ -92,12 +91,19 @@ pub fn scan_mft_drive(
             root.join(&info.path)
         };
         let path_s = path.to_string_lossy();
-        if !path_s.to_ascii_lowercase().starts_with(&format!("{letter}:\\").to_ascii_lowercase())
+        if !path_s
+            .to_ascii_lowercase()
+            .starts_with(&format!("{letter}:\\").to_ascii_lowercase())
             && path_s.to_ascii_lowercase() != format!("{letter}:").to_ascii_lowercase()
             && path_s.to_ascii_lowercase() != format!("{letter}:\\").to_ascii_lowercase()
         {
             // FileInfo path 有时已是完整路径
-            if !path_s.chars().next().map(|c| c.eq_ignore_ascii_case(&letter)).unwrap_or(false) {
+            if !path_s
+                .chars()
+                .next()
+                .map(|c| c.eq_ignore_ascii_case(&letter))
+                .unwrap_or(false)
+            {
                 continue;
             }
         }
@@ -116,7 +122,18 @@ pub fn scan_mft_drive(
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
-        let mtime: Option<SystemTime> = None;
+        let mtime: Option<SystemTime> = info.modified.and_then(|value| {
+            let seconds = value.unix_timestamp();
+            if seconds < 0 {
+                None
+            } else {
+                Some(
+                    std::time::UNIX_EPOCH
+                        + Duration::from_secs(seconds as u64)
+                        + Duration::from_nanos(value.nanosecond() as u64),
+                )
+            }
+        });
         let size = if info.is_directory { 0 } else { info.size };
 
         index.entries.insert(
@@ -189,6 +206,11 @@ pub fn scan_mft_drive(
     }
 
     index.partial = cancel.load(Ordering::Relaxed);
+    index.quality = if index.partial {
+        EstimateQuality::Estimated
+    } else {
+        EstimateQuality::Complete
+    };
     index.rebuild_children();
     index.file_count = index.entries.values().filter(|e| !e.is_dir).count() as u64;
     index.dir_count = index.entries.values().filter(|e| e.is_dir).count() as u64;
@@ -197,7 +219,11 @@ pub fn scan_mft_drive(
     on_event(ScanEvent::Progress(ScanProgress {
         visited,
         skipped: 0,
-        bytes_seen: index.entries.get(&ScanIndex::key(&root)).map(|e| e.size).unwrap_or(0),
+        bytes_seen: index
+            .entries
+            .get(&ScanIndex::key(&root))
+            .map(|e| e.size)
+            .unwrap_or(0),
         current: root.display().to_string(),
         elapsed: started.elapsed(),
         done: true,
@@ -288,9 +314,15 @@ mod tests {
 
     #[test]
     fn system_dirs_are_ignored_in_mft() {
-        assert!(in_system_ignored_dir(Path::new(r"C:\$Recycle.Bin\S-1-5-21\file")));
-        assert!(in_system_ignored_dir(Path::new(r"D:\System Volume Information\x")));
-        assert!(!in_system_ignored_dir(Path::new(r"C:\Users\a\Recycle.Bin.txt")));
+        assert!(in_system_ignored_dir(Path::new(
+            r"C:\$Recycle.Bin\S-1-5-21\file"
+        )));
+        assert!(in_system_ignored_dir(Path::new(
+            r"D:\System Volume Information\x"
+        )));
+        assert!(!in_system_ignored_dir(Path::new(
+            r"C:\Users\a\Recycle.Bin.txt"
+        )));
         assert!(!in_system_ignored_dir(Path::new(r"C:\Windows\Temp")));
     }
 

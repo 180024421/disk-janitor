@@ -99,9 +99,7 @@ fn read_app(hive: &'static str, parent: &str, name: &str, sub: &RegKey) -> Optio
         return None;
     }
 
-    let quiet: String = sub
-        .get_value("QuietUninstallString")
-        .unwrap_or_default();
+    let quiet: String = sub.get_value("QuietUninstallString").unwrap_or_default();
     let version: String = sub.get_value("DisplayVersion").unwrap_or_default();
     let publisher: String = sub.get_value("Publisher").unwrap_or_default();
     let install_location: String = sub.get_value("InstallLocation").unwrap_or_default();

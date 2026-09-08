@@ -28,9 +28,7 @@ pub fn is_elevated() -> bool {
 pub fn relaunch_as_admin() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe_s = exe.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "Start-Process -FilePath '{exe_s}' -Verb RunAs"
-    );
+    let script = format!("Start-Process -FilePath '{exe_s}' -Verb RunAs");
     let status = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)

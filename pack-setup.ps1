@@ -72,7 +72,19 @@ $setupEn = Join-Path $root "release\DashuaiCleaner-Setup-$ver.exe"
 Copy-Item -Force $setupSrc $setupCn
 Copy-Item -Force $setupSrc $setupEn
 
+if ((Get-Item $setupCn).Length -gt 300MB) { throw "setup payload exceeds 300 MB" }
 $sha = (Get-FileHash -Algorithm SHA256 -Path $setupCn).Hash.ToLowerInvariant()
+if ($sha -notmatch '^[0-9a-f]{64}$') { throw "invalid setup SHA256" }
+$updateManifest = Get-Content -Raw (Join-Path $root "deploy\app-update.json") | ConvertFrom-Json
+$updateUri = $null
+if (-not [Uri]::TryCreate([string]$updateManifest.desktopUrl, [UriKind]::Absolute, [ref]$updateUri) -or
+    $updateUri.Scheme -ne [Uri]::UriSchemeHttps -or
+    [string]::IsNullOrWhiteSpace($updateUri.Host)) {
+  throw "app-update desktopUrl must be an absolute HTTPS URL"
+}
+if ([string]$updateManifest.sha256 -notmatch '^[0-9a-f]{64}$') {
+  throw "app-update SHA256 must be 64 lowercase hex characters"
+}
 $meta = [ordered]@{
   productName = $product
   versionCode = $code

@@ -5,6 +5,29 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimateQuality {
+    #[default]
+    Complete,
+    Estimated,
+    Truncated,
+    PermissionLimited,
+    Unavailable,
+}
+
+impl EstimateQuality {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "完整",
+            Self::Estimated => "估算",
+            Self::Truncated => "达到上限",
+            Self::PermissionLimited => "权限受限",
+            Self::Unavailable => "不可用",
+        }
+    }
+}
+
 mod mtime_serde {
     use super::*;
     use serde::{Deserializer, Serializer};
@@ -76,6 +99,9 @@ pub struct ScanIndex {
     /// 取消时尚未扫描的目录（用于断点续扫）
     #[serde(default)]
     pub resume_stack: Vec<PathBuf>,
+    /// 扫描结果是否完整，避免把估算/截断结果展示为精确值。
+    #[serde(default)]
+    pub quality: EstimateQuality,
 }
 
 impl ScanIndex {
@@ -125,9 +151,7 @@ impl ScanIndex {
         let Some(keys) = self.children.get(&parent) else {
             return Vec::new();
         };
-        keys.iter()
-            .filter_map(|k| self.entries.get(k))
-            .collect()
+        keys.iter().filter_map(|k| self.entries.get(k)).collect()
     }
 
     pub fn child_dirs_of(&self, dir: &Path) -> Vec<&FsEntry> {

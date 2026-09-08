@@ -1,5 +1,6 @@
 //! 深度卸载辅助：占用进程 / AppX / 相关服务与计划任务（PowerShell / schtasks）
 
+use crate::operation_log;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Command;
@@ -40,7 +41,12 @@ pub fn list_locking_processes(paths: &[PathBuf]) -> Vec<LockingProcess> {
         .iter()
         .filter_map(|p| {
             let abs = std::path::absolute(p).unwrap_or_else(|_| p.clone());
-            Some(abs.to_string_lossy().to_ascii_lowercase().trim_end_matches(['\\', '/']).to_string())
+            Some(
+                abs.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .trim_end_matches(['\\', '/'])
+                    .to_string(),
+            )
         })
         .filter(|s| !s.is_empty())
         .collect();
@@ -157,6 +163,9 @@ pub fn uninstall_appx(full_name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("PackageFullName 为空".into());
     }
+    if is_protected_appx(name) {
+        return Err("该包属于 Windows 系统组件保护名单，不允许在此卸载".into());
+    }
     let escaped = name.replace('\'', "''");
     let script = format!("Remove-AppxPackage -Package '{escaped}' -ErrorAction Stop");
     let out = Command::new("powershell")
@@ -164,10 +173,40 @@ pub fn uninstall_appx(full_name: &str) -> Result<(), String> {
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
+        operation_log::append(
+            "appx-uninstall",
+            &PathBuf::from(name),
+            "requested",
+            "Remove-AppxPackage 已成功执行",
+        );
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        let error = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        operation_log::append("appx-uninstall", &PathBuf::from(name), "failed", &error);
+        Err(error)
     }
+}
+
+pub fn is_protected_appx(full_name: &str) -> bool {
+    let name = full_name.trim().to_ascii_lowercase();
+    [
+        "microsoft.windows.",
+        "microsoftwindows.",
+        "microsoft.sechealthui",
+        "microsoft.windowsstore",
+        "microsoft.storepurchaseapp",
+        "microsoft.desktopappinstaller",
+        "microsoft.vclibs",
+        "microsoft.ui.xaml",
+        "microsoft.net.native",
+        "microsoft.aad.brokerplugin",
+        "microsoft.accountscontrol",
+        "microsoft.lockapp",
+        "microsoft.shell",
+        "microsoft.startmenuexperiencehost",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 pub fn list_related_services(tokens: &[String]) -> Vec<RelatedService> {
@@ -269,8 +308,7 @@ fn parse_tasks(raw: &str) -> Vec<RelatedTask> {
 /// 从显示名生成过滤 token（去掉过短片段）。
 pub fn tokens_from_name(display_name: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let cleaned = display_name
-        .replace(['(', ')', '[', ']', '{', '}'], " ");
+    let cleaned = display_name.replace(['(', ')', '[', ']', '{', '}'], " ");
     for part in cleaned.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
         let t = part.trim();
         if t.len() >= 3 {
@@ -318,5 +356,18 @@ mod tests {
     fn parse_empty_locking() {
         assert!(parse_locking("").is_empty());
         assert!(parse_locking("null").is_empty());
+    }
+
+    #[test]
+    fn protects_critical_appx_packages() {
+        assert!(is_protected_appx(
+            "Microsoft.WindowsStore_22401.1401.1.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(is_protected_appx(
+            "Microsoft.SecHealthUI_1000.1.0.0_x64__8wekyb3d8bbwe"
+        ));
+        assert!(!is_protected_appx(
+            "SpotifyAB.SpotifyMusic_1.0.0.0_x64__example"
+        ));
     }
 }

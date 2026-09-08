@@ -1,10 +1,35 @@
 //! 常见垃圾规则建议
 
-use crate::model::{format_bytes, is_sensitive_path};
-use crate::scan::quick_dir_size;
+use crate::model::{format_bytes, is_sensitive_path, EstimateQuality};
+use crate::scan::quick_dir_size_with_status;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JunkSource {
+    Windows,
+    Browser,
+    DeveloperTool,
+    Communication,
+    Office,
+    GamePlatform,
+    UserFiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rebuildability {
+    Rebuildable,
+    PartiallyRebuildable,
+    NotRebuildable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserContentRisk {
+    None,
+    Possible,
+    ContainsUserContent,
+}
 
 #[derive(Debug, Clone)]
 pub struct JunkRule {
@@ -14,6 +39,25 @@ pub struct JunkRule {
     pub sensitive: bool,
     /// 默认是否勾选
     pub default_selected: bool,
+    pub source: JunkSource,
+    pub rebuildability: Rebuildability,
+    pub user_content_risk: UserContentRisk,
+    /// 只把达到此年龄的文件交给清理层；None 表示不按年龄过滤。
+    pub min_age_days: Option<u32>,
+    /// 扫描可以在线进行，但清理前应关闭对应进程。
+    pub requires_process_exit: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgePreview {
+    pub total_files: u64,
+    pub total_size: u64,
+    pub older_than_7_days_files: u64,
+    pub older_than_7_days_size: u64,
+    pub older_than_30_days_files: u64,
+    pub older_than_30_days_size: u64,
+    pub older_than_90_days_files: u64,
+    pub older_than_90_days_size: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,171 +71,387 @@ pub struct JunkHit {
     pub sensitive: bool,
     pub selected: bool,
     pub note: String,
+    pub quality: EstimateQuality,
+    pub source: Option<JunkSource>,
+    pub rebuildability: Option<Rebuildability>,
+    pub user_content_risk: Option<UserContentRisk>,
+    pub min_age_days: Option<u32>,
+    pub requires_process_exit: bool,
+    pub age_preview: AgePreview,
+}
+
+macro_rules! rule {
+    ($id:literal, $title:literal, $detail:literal, $sensitive:expr, $selected:expr,
+     $source:expr, $rebuild:expr, $risk:expr, $age:expr, $close:expr) => {
+        JunkRule {
+            id: $id,
+            title: $title,
+            detail: $detail,
+            sensitive: $sensitive,
+            default_selected: $selected,
+            source: $source,
+            rebuildability: $rebuild,
+            user_content_risk: $risk,
+            min_age_days: $age,
+            requires_process_exit: $close,
+        }
+    };
 }
 
 const RULES: &[JunkRule] = &[
-    JunkRule {
-        id: "user_temp",
-        title: "用户临时文件",
-        detail: "%TEMP% / Local\\Temp",
-        sensitive: false,
-        default_selected: true,
-    },
-    JunkRule {
-        id: "win_temp",
-        title: "Windows\\Temp",
-        detail: "系统临时目录（可能需管理员）",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "prefetch",
-        title: "Prefetch",
-        detail: "预读取缓存（清理后可能拖慢开机，默认不勾选）",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "thumbcache",
-        title: "缩略图缓存",
-        detail: "Explorer 缩略图数据库",
-        sensitive: false,
-        default_selected: true,
-    },
-    JunkRule {
-        id: "delivery_opt",
-        title: "传递优化缓存",
-        detail: "Windows Delivery Optimization",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "chrome_cache",
-        title: "Chrome 缓存",
-        detail: "Cache / Code Cache / GPUCache（Default）",
-        sensitive: false,
-        default_selected: true,
-    },
-    JunkRule {
-        id: "edge_cache",
-        title: "Edge 缓存",
-        detail: "Cache / Code Cache / GPUCache（Default）",
-        sensitive: false,
-        default_selected: true,
-    },
-    JunkRule {
-        id: "firefox_cache",
-        title: "Firefox 缓存",
-        detail: "Local\\Mozilla\\Firefox\\Profiles\\*\\cache2",
-        sensitive: false,
-        default_selected: true,
-    },
-    JunkRule {
-        id: "npm_cache",
-        title: "npm 缓存",
-        detail: "%LOCALAPPDATA%\\npm-cache",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "pip_cache",
-        title: "pip 缓存",
-        detail: "Local\\pip\\Cache",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "cargo_cache",
-        title: "Cargo 注册表缓存",
-        detail: "%USERPROFILE%\\.cargo\\registry\\cache",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "downloads_large_old",
-        title: "下载目录：大而旧的文件",
-        detail: "Downloads 中 >100MB 且超过 90 天（含子文件夹）",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "win_update_download",
-        title: "Windows Update 下载缓存",
-        detail: "SoftwareDistribution\\Download（敏感，默认不勾选）",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "chrome_cache_profiles",
-        title: "Chrome 其他配置缓存",
-        detail: "User Data\\Profile *\\Cache 等（默认不勾选）",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "edge_profile_cache",
-        title: "Edge 其他配置缓存",
-        detail: "User Data\\Profile *\\Cache 等（默认不勾选）",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "windows_old",
-        title: "Windows.old",
-        detail: "系统盘根目录 Windows.old（升级残留，体积大）",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "cbs_logs",
-        title: "CBS 日志",
-        detail: "Windows\\Logs\\CBS",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "font_cache",
-        title: "字体缓存",
-        detail: "Local\\FontCache / Service\\FontCache",
-        sensitive: false,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "directx_shader",
-        title: "DirectX 着色器缓存",
-        detail: "D3DSCache / DXCache",
-        sensitive: false,
-        default_selected: true,
-    },
-    JunkRule {
-        id: "edge_cookies",
-        title: "隐私·Edge Cookies（默认不勾选）",
-        detail: "User Data\\Default\\Network\\Cookies",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "chrome_cookies",
-        title: "隐私·Chrome Cookies（默认不勾选）",
-        detail: "User Data\\Default\\Network\\Cookies",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "edge_history",
-        title: "隐私·Edge 历史（默认不勾选）",
-        detail: "User Data\\Default\\History",
-        sensitive: true,
-        default_selected: false,
-    },
-    JunkRule {
-        id: "chrome_history",
-        title: "隐私·Chrome 历史（默认不勾选）",
-        detail: "User Data\\Default\\History",
-        sensitive: true,
-        default_selected: false,
-    },
+    rule!(
+        "user_temp",
+        "用户临时文件",
+        "%TEMP% / Local\\Temp",
+        false,
+        true,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::Possible,
+        Some(7),
+        false
+    ),
+    rule!(
+        "win_temp",
+        "Windows\\Temp",
+        "系统临时目录（可能需管理员）",
+        true,
+        false,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::Possible,
+        Some(7),
+        false
+    ),
+    rule!(
+        "prefetch",
+        "Prefetch",
+        "预读取缓存（清理后可能拖慢开机，默认不勾选）",
+        true,
+        false,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        false
+    ),
+    rule!(
+        "thumbcache",
+        "缩略图缓存",
+        "Explorer 缩略图数据库",
+        false,
+        true,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "delivery_opt",
+        "传递优化缓存",
+        "Windows Delivery Optimization",
+        true,
+        false,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "chrome_cache",
+        "Chrome 缓存",
+        "Cache / Code Cache / GPUCache（Default）",
+        false,
+        true,
+        JunkSource::Browser,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "edge_cache",
+        "Edge 缓存",
+        "Cache / Code Cache / GPUCache（Default）",
+        false,
+        true,
+        JunkSource::Browser,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "firefox_cache",
+        "Firefox 缓存",
+        "Local\\Mozilla\\Firefox\\Profiles\\*\\cache2",
+        false,
+        true,
+        JunkSource::Browser,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "npm_cache",
+        "npm 缓存",
+        "%LOCALAPPDATA%\\npm-cache",
+        false,
+        false,
+        JunkSource::DeveloperTool,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "pip_cache",
+        "pip 缓存",
+        "Local\\pip\\Cache",
+        false,
+        false,
+        JunkSource::DeveloperTool,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "cargo_cache",
+        "Cargo 注册表缓存",
+        "%USERPROFILE%\\.cargo\\registry\\cache",
+        false,
+        false,
+        JunkSource::DeveloperTool,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "downloads_large_old",
+        "下载目录：大而旧的文件",
+        "Downloads 中 >100MB 且超过 90 天（含子文件夹）",
+        false,
+        false,
+        JunkSource::UserFiles,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::ContainsUserContent,
+        Some(90),
+        false
+    ),
+    rule!(
+        "win_update_download",
+        "Windows Update 下载缓存",
+        "SoftwareDistribution\\Download（敏感，默认不勾选）",
+        true,
+        false,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "chrome_cache_profiles",
+        "Chrome 其他配置缓存",
+        "User Data\\Profile *\\Cache 等（默认不勾选）",
+        false,
+        false,
+        JunkSource::Browser,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "edge_profile_cache",
+        "Edge 其他配置缓存",
+        "User Data\\Profile *\\Cache 等（默认不勾选）",
+        false,
+        false,
+        JunkSource::Browser,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "windows_old",
+        "Windows.old",
+        "系统盘根目录 Windows.old（升级残留，体积大）",
+        true,
+        false,
+        JunkSource::Windows,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::ContainsUserContent,
+        None,
+        false
+    ),
+    rule!(
+        "cbs_logs",
+        "CBS 日志",
+        "Windows\\Logs\\CBS",
+        true,
+        false,
+        JunkSource::Windows,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "font_cache",
+        "字体缓存",
+        "Local\\FontCache / Service\\FontCache",
+        false,
+        false,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "directx_shader",
+        "DirectX 着色器缓存",
+        "D3DSCache / DXCache",
+        false,
+        true,
+        JunkSource::Windows,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        None,
+        true
+    ),
+    rule!(
+        "edge_cookies",
+        "隐私·Edge Cookies（默认不勾选）",
+        "User Data\\Default\\Network\\Cookies",
+        true,
+        false,
+        JunkSource::Browser,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::ContainsUserContent,
+        None,
+        true
+    ),
+    rule!(
+        "chrome_cookies",
+        "隐私·Chrome Cookies（默认不勾选）",
+        "User Data\\Default\\Network\\Cookies",
+        true,
+        false,
+        JunkSource::Browser,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::ContainsUserContent,
+        None,
+        true
+    ),
+    rule!(
+        "edge_history",
+        "隐私·Edge 历史（默认不勾选）",
+        "User Data\\Default\\History",
+        true,
+        false,
+        JunkSource::Browser,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::ContainsUserContent,
+        None,
+        true
+    ),
+    rule!(
+        "chrome_history",
+        "隐私·Chrome 历史（默认不勾选）",
+        "User Data\\Default\\History",
+        true,
+        false,
+        JunkSource::Browser,
+        Rebuildability::NotRebuildable,
+        UserContentRisk::ContainsUserContent,
+        None,
+        true
+    ),
+    rule!(
+        "wechat_cache",
+        "微信可重建缓存",
+        "WeChat/Weixin 已知 Cache、Code Cache、GPUCache",
+        true,
+        false,
+        JunkSource::Communication,
+        Rebuildability::PartiallyRebuildable,
+        UserContentRisk::Possible,
+        Some(7),
+        true
+    ),
+    rule!(
+        "qq_cache",
+        "QQ 可重建缓存",
+        "QQ/QQNT 已知 Cache、Code Cache、GPUCache",
+        true,
+        false,
+        JunkSource::Communication,
+        Rebuildability::PartiallyRebuildable,
+        UserContentRisk::Possible,
+        Some(7),
+        true
+    ),
+    rule!(
+        "wps_cache",
+        "WPS 可重建缓存",
+        "Kingsoft/WPS 已知 cache/temp 目录",
+        true,
+        false,
+        JunkSource::Office,
+        Rebuildability::PartiallyRebuildable,
+        UserContentRisk::Possible,
+        Some(7),
+        true
+    ),
+    rule!(
+        "vscode_cache",
+        "VS Code 可重建缓存",
+        "Cache、CachedData、Code Cache、GPUCache",
+        false,
+        false,
+        JunkSource::DeveloperTool,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        Some(7),
+        true
+    ),
+    rule!(
+        "jetbrains_cache",
+        "JetBrains IDE 缓存",
+        "Local\\JetBrains\\*\\caches",
+        false,
+        false,
+        JunkSource::DeveloperTool,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        Some(7),
+        true
+    ),
+    rule!(
+        "steam_cache",
+        "Steam 网页缓存",
+        "appcache\\httpcache / htmlcache",
+        false,
+        false,
+        JunkSource::GamePlatform,
+        Rebuildability::Rebuildable,
+        UserContentRisk::None,
+        Some(7),
+        true
+    ),
 ];
+
+pub fn builtin_junk_rules() -> &'static [JunkRule] {
+    RULES
+}
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
@@ -238,6 +498,33 @@ fn browser_profile_cache_dirs(product: &str, company: &str) -> Vec<PathBuf> {
     out
 }
 
+fn push_known_children(out: &mut Vec<PathBuf>, base: PathBuf, children: &[&str]) {
+    for child in children {
+        out.push(base.join(child));
+    }
+}
+
+fn push_product_caches(out: &mut Vec<PathBuf>, root: &Path, products: &[&str]) {
+    const CACHE_NAMES: &[&str] = &["Cache", "Code Cache", "GPUCache"];
+    for product in products {
+        push_known_children(out, root.join(product), CACHE_NAMES);
+    }
+}
+
+fn jetbrains_cache_dirs(local: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let root = local.join("JetBrains");
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.push(path.join("caches"));
+            }
+        }
+    }
+    out
+}
+
 fn rule_paths(id: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     match id {
@@ -253,12 +540,7 @@ fn rule_paths(id: &str) -> Vec<PathBuf> {
         "prefetch" => out.push(PathBuf::from(r"C:\Windows\Prefetch")),
         "thumbcache" => {
             if let Some(local) = env_path("LOCALAPPDATA") {
-                out.push(
-                    local
-                        .join("Microsoft")
-                        .join("Windows")
-                        .join("Explorer"),
-                );
+                out.push(local.join("Microsoft").join("Windows").join("Explorer"));
             }
         }
         "delivery_opt" => {
@@ -347,12 +629,7 @@ fn rule_paths(id: &str) -> Vec<PathBuf> {
         "directx_shader" => {
             if let Some(local) = env_path("LOCALAPPDATA") {
                 out.push(local.join("D3DSCache"));
-                out.push(
-                    local
-                        .join("Microsoft")
-                        .join("Windows")
-                        .join("DXCache"),
-                );
+                out.push(local.join("Microsoft").join("Windows").join("DXCache"));
             }
         }
         "edge_cookies" => {
@@ -405,12 +682,79 @@ fn rule_paths(id: &str) -> Vec<PathBuf> {
                 );
             }
         }
+        "wechat_cache" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                push_product_caches(
+                    &mut out,
+                    &local.join("Tencent"),
+                    &["WeChat", "WeChatAppEx", "Weixin"],
+                );
+            }
+            if let Some(roaming) = env_path("APPDATA") {
+                push_product_caches(&mut out, &roaming.join("Tencent"), &["WeChat", "Weixin"]);
+            }
+        }
+        "qq_cache" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                push_product_caches(&mut out, &local.join("Tencent"), &["QQ", "QQNT"]);
+            }
+            if let Some(roaming) = env_path("APPDATA") {
+                push_product_caches(&mut out, &roaming.join("Tencent"), &["QQ", "QQNT"]);
+            }
+        }
+        "wps_cache" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                push_known_children(
+                    &mut out,
+                    local.join("Kingsoft").join("WPS Office"),
+                    &["cache", "temp"],
+                );
+            }
+            if let Some(roaming) = env_path("APPDATA") {
+                push_known_children(
+                    &mut out,
+                    roaming.join("kingsoft").join("office6"),
+                    &["cache", "temp"],
+                );
+            }
+        }
+        "vscode_cache" => {
+            if let Some(roaming) = env_path("APPDATA") {
+                push_known_children(
+                    &mut out,
+                    roaming.join("Code"),
+                    &["Cache", "CachedData", "Code Cache", "GPUCache"],
+                );
+            }
+        }
+        "jetbrains_cache" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.extend(jetbrains_cache_dirs(&local));
+            }
+        }
+        "steam_cache" => {
+            if let Some(local) = env_path("LOCALAPPDATA") {
+                out.push(local.join("Steam").join("htmlcache"));
+            }
+            if let Some(program_files) = env_path("ProgramFiles(x86)") {
+                out.push(
+                    program_files
+                        .join("Steam")
+                        .join("appcache")
+                        .join("httpcache"),
+                );
+            }
+        }
         _ => {}
     }
-    out.into_iter().filter(|p| p.exists()).collect()
+    let mut seen = std::collections::HashSet::new();
+    out.into_iter()
+        .filter(|p| p.exists())
+        .filter(|p| seen.insert(p.to_string_lossy().to_ascii_lowercase()))
+        .collect()
 }
 
-fn collect_large_old_files(dir: &Path, cancel: &AtomicBool) -> (Vec<PathBuf>, u64) {
+fn collect_large_old_files(dir: &Path, cancel: &AtomicBool) -> (Vec<PathBuf>, u64, bool) {
     let mut paths = Vec::new();
     let mut size = 0u64;
     let now = SystemTime::now();
@@ -418,8 +762,10 @@ fn collect_large_old_files(dir: &Path, cancel: &AtomicBool) -> (Vec<PathBuf>, u6
     let min_size = 100u64 * 1024 * 1024;
     let mut stack = vec![dir.to_path_buf()];
     let mut visited = 0u64;
+    let mut complete = true;
     while let Some(d) = stack.pop() {
         if cancel.load(Ordering::Relaxed) || visited > 20_000 {
+            complete = false;
             break;
         }
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -459,7 +805,7 @@ fn collect_large_old_files(dir: &Path, cancel: &AtomicBool) -> (Vec<PathBuf>, u6
             }
         }
     }
-    (paths, size)
+    (paths, size, complete)
 }
 
 fn collect_thumbcache_files(dir: &Path) -> (Vec<PathBuf>, u64) {
@@ -485,6 +831,131 @@ fn collect_thumbcache_files(dir: &Path) -> (Vec<PathBuf>, u64) {
     (paths, size)
 }
 
+fn collect_old_temp_files(
+    dir: &Path,
+    cancel: &AtomicBool,
+    min_age: Duration,
+    max_files: usize,
+) -> (Vec<PathBuf>, u64, bool) {
+    let mut paths = Vec::new();
+    let mut size = 0_u64;
+    let mut stack = vec![dir.to_path_buf()];
+    let now = SystemTime::now();
+    let mut complete = true;
+    while let Some(current) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) || paths.len() >= max_files {
+            complete = false;
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if cancel.load(Ordering::Relaxed) || paths.len() >= max_files {
+                complete = false;
+                break;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(age) = meta
+                .modified()
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+            else {
+                continue;
+            };
+            if age >= min_age {
+                size = size.saturating_add(meta.len());
+                paths.push(path);
+            }
+        }
+    }
+    (paths, size, complete)
+}
+
+fn add_age_sample(preview: &mut AgePreview, size: u64, age: Duration) {
+    preview.total_files += 1;
+    preview.total_size = preview.total_size.saturating_add(size);
+    for (days, files, bytes) in [
+        (
+            7,
+            &mut preview.older_than_7_days_files,
+            &mut preview.older_than_7_days_size,
+        ),
+        (
+            30,
+            &mut preview.older_than_30_days_files,
+            &mut preview.older_than_30_days_size,
+        ),
+        (
+            90,
+            &mut preview.older_than_90_days_files,
+            &mut preview.older_than_90_days_size,
+        ),
+    ] {
+        if age >= Duration::from_secs(days * 24 * 3600) {
+            *files += 1;
+            *bytes = bytes.saturating_add(size);
+        }
+    }
+}
+
+fn collect_files_with_age(
+    bases: &[PathBuf],
+    cancel: &AtomicBool,
+    min_age_days: Option<u32>,
+    max_files: usize,
+) -> (Vec<PathBuf>, u64, AgePreview, bool) {
+    let mut eligible = Vec::new();
+    let mut eligible_size = 0_u64;
+    let mut preview = AgePreview::default();
+    let mut stack = bases.to_vec();
+    let now = SystemTime::now();
+    let min_age = min_age_days.map(|days| Duration::from_secs(days as u64 * 24 * 3600));
+    let mut visited = 0_usize;
+    let mut complete = true;
+    while let Some(path) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) || visited >= max_files {
+            complete = false;
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                continue;
+            };
+            stack.extend(entries.flatten().map(|entry| entry.path()));
+            continue;
+        }
+        visited += 1;
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .unwrap_or_default();
+        add_age_sample(&mut preview, meta.len(), age);
+        if min_age.map_or(true, |threshold| age >= threshold) {
+            eligible_size = eligible_size.saturating_add(meta.len());
+            eligible.push(path);
+        }
+    }
+    (eligible, eligible_size, preview, complete)
+}
+
 pub fn scan_junk(cancel: &AtomicBool) -> Vec<JunkHit> {
     let mut hits = Vec::new();
     for rule in RULES {
@@ -498,13 +969,40 @@ pub fn scan_junk(cancel: &AtomicBool) -> Vec<JunkHit> {
         let mut paths = Vec::new();
         let mut size = 0u64;
         let mut note = String::new();
+        let mut quality = EstimateQuality::Complete;
+        let mut age_preview = AgePreview::default();
 
         match rule.id {
+            "user_temp" => {
+                for b in &bases {
+                    let (ps, sz, complete) = collect_old_temp_files(
+                        b,
+                        cancel,
+                        Duration::from_secs(7 * 24 * 3600),
+                        200_000,
+                    );
+                    size = size.saturating_add(sz);
+                    paths.extend(ps);
+                    if !complete {
+                        quality = EstimateQuality::Truncated;
+                    }
+                }
+                note = format!("{} 个超过 7 天的临时文件", paths.len());
+                let (_, _, preview, complete) =
+                    collect_files_with_age(&bases, cancel, Some(7), 200_000);
+                age_preview = preview;
+                if !complete {
+                    quality = EstimateQuality::Truncated;
+                }
+            }
             "downloads_large_old" => {
                 for b in &bases {
-                    let (ps, sz) = collect_large_old_files(b, cancel);
+                    let (ps, sz, complete) = collect_large_old_files(b, cancel);
                     size += sz;
                     paths.extend(ps);
+                    if !complete {
+                        quality = EstimateQuality::Truncated;
+                    }
                 }
                 note = format!("{} 个文件", paths.len());
             }
@@ -525,19 +1023,51 @@ pub fn scan_junk(cancel: &AtomicBool) -> Vec<JunkHit> {
                 }
                 note = "隐私数据·默认不勾选".into();
             }
+            "wechat_cache" | "qq_cache" | "wps_cache" | "vscode_cache" | "jetbrains_cache"
+            | "steam_cache" => {
+                let (ps, sz, preview, complete) =
+                    collect_files_with_age(&bases, cancel, rule.min_age_days, 400_000);
+                paths = ps;
+                size = sz;
+                age_preview = preview;
+                if !complete {
+                    quality = EstimateQuality::Truncated;
+                }
+                note = format!(
+                    "{} 个达到 {} 天的文件（全部默认不勾选）",
+                    paths.len(),
+                    rule.min_age_days.unwrap_or(0)
+                );
+            }
             _ => {
                 for b in &bases {
-                    let (sz, files) = quick_dir_size(b, cancel, 400_000);
+                    let (sz, files, complete) = quick_dir_size_with_status(b, cancel, 400_000);
                     size += sz;
                     paths.push(b.clone());
+                    if !complete {
+                        quality = EstimateQuality::Truncated;
+                    }
                     if !note.is_empty() {
                         note.push_str(" · ");
                     }
                     note.push_str(&format!("{} 文件约 {}", files, format_bytes(sz)));
                 }
+                let (_, _, preview, complete) =
+                    collect_files_with_age(&bases, cancel, None, 400_000);
+                age_preview = preview;
+                if !complete {
+                    quality = EstimateQuality::Truncated;
+                }
             }
         }
 
+        if age_preview.total_files == 0 {
+            let (_, _, preview, complete) = collect_files_with_age(&bases, cancel, None, 400_000);
+            age_preview = preview;
+            if !complete {
+                quality = EstimateQuality::Truncated;
+            }
+        }
         if size == 0 && paths.is_empty() {
             continue;
         }
@@ -552,6 +1082,13 @@ pub fn scan_junk(cancel: &AtomicBool) -> Vec<JunkHit> {
             sensitive,
             selected,
             note,
+            quality,
+            source: Some(rule.source),
+            rebuildability: Some(rule.rebuildability),
+            user_content_risk: Some(rule.user_content_risk),
+            min_age_days: rule.min_age_days,
+            requires_process_exit: rule.requires_process_exit,
+            age_preview,
         });
     }
     hits.sort_by(|a, b| b.size.cmp(&a.size));
@@ -662,5 +1199,68 @@ mod tests {
         let safe = safe_junk_hits(hits);
         assert_eq!(safe.len(), 1);
         assert_eq!(safe[0].rule_id, "user_temp");
+    }
+
+    #[test]
+    fn temp_collection_skips_recent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let recent = dir.path().join("recent.tmp");
+        std::fs::write(&recent, b"recent").unwrap();
+        let cancel = AtomicBool::new(false);
+        let (paths, _, _) =
+            collect_old_temp_files(dir.path(), &cancel, Duration::from_secs(24 * 3600), 100);
+        assert!(!paths.contains(&recent));
+    }
+
+    #[test]
+    fn precision_rules_are_builtin_and_never_preselected() {
+        let ids = [
+            "wechat_cache",
+            "qq_cache",
+            "wps_cache",
+            "vscode_cache",
+            "jetbrains_cache",
+            "steam_cache",
+        ];
+        for id in ids {
+            let rule = builtin_junk_rules()
+                .iter()
+                .find(|rule| rule.id == id)
+                .unwrap();
+            assert!(!rule.default_selected);
+            assert_eq!(rule.min_age_days, Some(7));
+            assert!(rule.requires_process_exit);
+            assert_ne!(rule.rebuildability, Rebuildability::NotRebuildable);
+        }
+    }
+
+    #[test]
+    fn age_preview_uses_cumulative_thresholds() {
+        let mut preview = AgePreview::default();
+        add_age_sample(&mut preview, 10, Duration::from_secs(8 * 24 * 3600));
+        add_age_sample(&mut preview, 20, Duration::from_secs(40 * 24 * 3600));
+        add_age_sample(&mut preview, 30, Duration::from_secs(100 * 24 * 3600));
+        assert_eq!(preview.total_size, 60);
+        assert_eq!(preview.older_than_7_days_size, 60);
+        assert_eq!(preview.older_than_30_days_size, 50);
+        assert_eq!(preview.older_than_90_days_size, 30);
+    }
+
+    #[test]
+    fn product_cache_paths_only_use_fixed_child_names() {
+        let mut paths = Vec::new();
+        push_product_caches(
+            &mut paths,
+            Path::new(r"C:\Users\a\AppData\Local\Tencent"),
+            &["QQNT"],
+        );
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\Users\a\AppData\Local\Tencent\QQNT\Cache"),
+                PathBuf::from(r"C:\Users\a\AppData\Local\Tencent\QQNT\Code Cache"),
+                PathBuf::from(r"C:\Users\a\AppData\Local\Tencent\QQNT\GPUCache"),
+            ]
+        );
     }
 }

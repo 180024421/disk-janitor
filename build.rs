@@ -18,11 +18,8 @@ fn main() {
     }
     let code = version_code_from_name(&version);
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("version_code.rs");
-    fs::write(
-        &out,
-        format!("pub const APP_VERSION_CODE: u32 = {code};\n"),
-    )
-    .expect("write version_code.rs");
+    fs::write(&out, format!("pub const APP_VERSION_CODE: u32 = {code};\n"))
+        .expect("write version_code.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
 }
 

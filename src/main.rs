@@ -1,6 +1,7 @@
 mod about;
 mod admin;
 mod app;
+mod app_state;
 mod checkpoint;
 mod deep_uninstall;
 mod drives;
@@ -8,11 +9,15 @@ mod duplicates;
 mod export;
 mod fast_scan;
 mod file_types;
+mod jobs;
 mod junk;
 mod leftovers;
 mod model;
+mod operation_log;
 mod orphans;
 mod paths_ui;
+mod persistence;
+mod safety;
 mod scan;
 mod schedule;
 mod shortcuts;
@@ -39,6 +44,7 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     let open_path = parse_path_arg(&args);
+    let start_path_scan = args.iter().any(|a| a == "--scan");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -54,7 +60,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "大帅清理器",
         options,
-        Box::new(move |cc| Ok(Box::new(JanitorApp::new(cc, open_path.clone())))),
+        Box::new(move |cc| {
+            Ok(Box::new(JanitorApp::new(
+                cc,
+                open_path.clone(),
+                start_path_scan,
+            )))
+        }),
     )
 }
 

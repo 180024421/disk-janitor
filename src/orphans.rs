@@ -1,7 +1,9 @@
 //! 无效「卸载」注册表项（安装目录 / 卸载程序已不存在）
 
+use crate::operation_log;
 use crate::software::{expand_env, extract_exe_path, path_missing};
 use std::path::PathBuf;
+use std::process::Command;
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -138,7 +140,25 @@ fn classify_orphan(
 pub fn delete_orphan_keys(items: &[OrphanReg]) -> (usize, Vec<String>) {
     let mut ok = 0usize;
     let mut errs = Vec::new();
-    for item in items {
+    let backup_dir = recovery_dir();
+    if let Err(e) = std::fs::create_dir_all(&backup_dir) {
+        return (0, vec![format!("无法创建注册表恢复目录：{e}")]);
+    }
+    for (index, item) in items.iter().enumerate() {
+        let backup = backup_dir.join(format!(
+            "{index:03}-{}.reg",
+            safe_file_name(&item.display_name)
+        ));
+        if let Err(e) = export_registry_key(&item.full_path, &backup) {
+            errs.push(format!("{}: 备份失败，已取消删除：{e}", item.full_path));
+            operation_log::append(
+                "registry-delete",
+                &PathBuf::from(&item.full_path),
+                "blocked",
+                "注册表导出失败",
+            );
+            continue;
+        }
         let hkey = match item.hive {
             "HKLM" => HKEY_LOCAL_MACHINE,
             "HKCU" => HKEY_CURRENT_USER,
@@ -150,7 +170,15 @@ pub fn delete_orphan_keys(items: &[OrphanReg]) -> (usize, Vec<String>) {
         let root = RegKey::predef(hkey);
         match root.open_subkey_with_flags(&item.parent_path, KEY_ALL_ACCESS) {
             Ok(parent) => match parent.delete_subkey_all(&item.key_name) {
-                Ok(()) => ok += 1,
+                Ok(()) => {
+                    ok += 1;
+                    operation_log::append(
+                        "registry-delete",
+                        &PathBuf::from(&item.full_path),
+                        "backed-up-and-deleted",
+                        &backup.display().to_string(),
+                    );
+                }
                 Err(e) => errs.push(format!(
                     "{}: {}（HKLM 项通常需要管理员权限）",
                     item.full_path, e
@@ -160,6 +188,51 @@ pub fn delete_orphan_keys(items: &[OrphanReg]) -> (usize, Vec<String>) {
         }
     }
     (ok, errs)
+}
+
+fn recovery_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("disk-janitor")
+        .join("recovery")
+        .join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string())
+}
+
+fn safe_file_name(name: &str) -> String {
+    let value: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(60)
+        .collect();
+    if value.is_empty() {
+        "registry".into()
+    } else {
+        value
+    }
+}
+
+fn export_registry_key(full_path: &str, destination: &std::path::Path) -> Result<(), String> {
+    let output = Command::new("reg.exe")
+        .args(["export", full_path, &destination.to_string_lossy(), "/y"])
+        .output()
+        .map_err(|e| format!("无法调用 reg.exe：{e}"))?;
+    if output.status.success() && destination.is_file() {
+        Ok(())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr);
+        Err(if error.trim().is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            error.trim().to_string()
+        })
+    }
 }
 
 #[cfg(test)]

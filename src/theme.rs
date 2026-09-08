@@ -1,6 +1,7 @@
 //! 界面主题：Web 管理后台风格（侧栏 + 内容区 + 表格）
 
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Sense, Stroke, Ui, Vec2, Visuals};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const ACCENT: Color32 = Color32::from_rgb(45, 168, 196);
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(32, 128, 152);
@@ -16,39 +17,47 @@ pub const LINE: Color32 = Color32::from_rgb(51, 65, 85);
 pub const SIDEBAR: Color32 = Color32::from_rgb(11, 17, 32);
 pub const ROW_HOVER: Color32 = Color32::from_rgb(36, 48, 68);
 pub const ROW_ALT: Color32 = Color32::from_rgb(22, 32, 48);
+static DARK_MODE: AtomicBool = AtomicBool::new(true);
 
-pub fn apply_theme(ctx: &egui::Context) {
-    let mut v = Visuals::dark();
-    v.dark_mode = true;
-    v.window_fill = PANEL;
-    v.panel_fill = BG;
-    v.extreme_bg_color = Color32::from_rgb(8, 12, 22);
-    v.faint_bg_color = PANEL2;
-    v.code_bg_color = Color32::from_rgb(15, 23, 42);
-    v.override_text_color = Some(TEXT);
+pub fn apply_theme(ctx: &egui::Context, dark_mode: bool, compact: bool) {
+    DARK_MODE.store(dark_mode, Ordering::Relaxed);
+    let mut v = if dark_mode {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
+    v.dark_mode = dark_mode;
+    if dark_mode {
+        v.window_fill = PANEL;
+        v.panel_fill = BG;
+        v.extreme_bg_color = Color32::from_rgb(8, 12, 22);
+        v.faint_bg_color = PANEL2;
+        v.code_bg_color = Color32::from_rgb(15, 23, 42);
+        v.override_text_color = Some(TEXT);
+        v.widgets.noninteractive.bg_fill = PANEL;
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+        v.widgets.inactive.bg_fill = PANEL2;
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 52, 72);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(226, 232, 240));
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(56, 72, 96);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(56, 72, 96);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
+        v.widgets.open.bg_fill = PANEL2;
+    }
     v.hyperlink_color = ACCENT;
     v.warn_fg_color = WARN;
     v.error_fg_color = DANGER;
-    v.window_stroke = Stroke::new(1.0_f32, LINE);
+    v.window_stroke = Stroke::new(1.0_f32, line());
     v.window_corner_radius = CornerRadius::same(10);
     v.menu_corner_radius = CornerRadius::same(8);
-    v.widgets.noninteractive.bg_fill = PANEL;
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    v.widgets.inactive.bg_fill = PANEL2;
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 52, 72);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(226, 232, 240));
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
     v.widgets.inactive.corner_radius = CornerRadius::same(6);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(56, 72, 96);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(56, 72, 96);
     v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_DIM);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     v.widgets.hovered.corner_radius = CornerRadius::same(6);
     v.widgets.active.bg_fill = ACCENT_DIM;
     v.widgets.active.weak_bg_fill = ACCENT_DIM;
     v.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(8, 16, 24));
     v.widgets.active.corner_radius = CornerRadius::same(6);
-    v.widgets.open.bg_fill = PANEL2;
     v.widgets.open.corner_radius = CornerRadius::same(6);
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(45, 168, 196, 55);
     v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
@@ -61,8 +70,16 @@ pub fn apply_theme(ctx: &egui::Context) {
 
     let mut style = (*ctx.style()).clone();
     style.visuals = v;
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.item_spacing = if compact {
+        egui::vec2(6.0, 3.0)
+    } else {
+        egui::vec2(8.0, 6.0)
+    };
+    style.spacing.button_padding = if compact {
+        egui::vec2(9.0, 4.0)
+    } else {
+        egui::vec2(12.0, 6.0)
+    };
     style.spacing.indent = 16.0;
     style.spacing.window_margin = Margin::same(12);
     style.text_styles.insert(
@@ -84,47 +101,111 @@ pub fn apply_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+pub fn background() -> Color32 {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        BG
+    } else {
+        Color32::from_rgb(246, 248, 252)
+    }
+}
+
+pub fn panel() -> Color32 {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        PANEL
+    } else {
+        Color32::WHITE
+    }
+}
+
+pub fn foreground() -> Color32 {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        TEXT
+    } else {
+        Color32::from_rgb(30, 41, 59)
+    }
+}
+
+pub fn line() -> Color32 {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        LINE
+    } else {
+        Color32::from_rgb(203, 213, 225)
+    }
+}
+
+pub fn row_alt() -> Color32 {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        ROW_ALT
+    } else {
+        Color32::from_rgb(241, 245, 249)
+    }
+}
+
+/// 读取 Windows“应用使用浅色主题”偏好。读取失败时沿用深色外观。
+pub fn system_prefers_dark() -> bool {
+    #[cfg(windows)]
+    {
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        return hkcu
+            .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
+            .map(|value| value == 0)
+            .unwrap_or(true);
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 pub fn content_frame() -> Frame {
     Frame::new()
-        .fill(BG)
+        .fill(background())
         .inner_margin(Margin::symmetric(20, 16))
 }
 
 pub fn top_bar_frame() -> Frame {
     Frame::new()
-        .fill(Color32::from_rgb(17, 27, 46))
+        .fill(panel())
         .inner_margin(Margin::symmetric(16, 10))
-        .stroke(Stroke::new(1.0_f32, LINE))
+        .stroke(Stroke::new(1.0_f32, line()))
 }
 
 pub fn sidebar_frame() -> Frame {
     Frame::new()
-        .fill(SIDEBAR)
+        .fill(if DARK_MODE.load(Ordering::Relaxed) {
+            SIDEBAR
+        } else {
+            Color32::from_rgb(238, 242, 247)
+        })
         .inner_margin(Margin::symmetric(12, 14))
         .stroke(Stroke::new(1.0_f32, LINE))
 }
 
 pub fn status_bar_frame() -> Frame {
     Frame::new()
-        .fill(Color32::from_rgb(17, 27, 46))
+        .fill(panel())
         .inner_margin(Margin::symmetric(16, 8))
         .stroke(Stroke::new(1.0_f32, LINE))
 }
 
 pub fn card_frame() -> Frame {
     Frame::new()
-        .fill(PANEL)
+        .fill(panel())
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(14))
-        .stroke(Stroke::new(1.0_f32, LINE))
+        .stroke(Stroke::new(1.0_f32, line()))
 }
 
 pub fn table_frame() -> Frame {
     Frame::new()
-        .fill(PANEL)
+        .fill(panel())
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(0, 0))
-        .stroke(Stroke::new(1.0_f32, LINE))
+        .stroke(Stroke::new(1.0_f32, line()))
 }
 
 pub fn accent_button(text: &str) -> egui::Button<'static> {
@@ -140,11 +221,19 @@ pub fn accent_button(text: &str) -> egui::Button<'static> {
 }
 
 pub fn ghost_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_owned()).color(TEXT).size(13.0))
-        .fill(PANEL2)
-        .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(CornerRadius::same(6))
-        .min_size(Vec2::new(0.0, 30.0))
+    egui::Button::new(
+        RichText::new(text.to_owned())
+            .color(foreground())
+            .size(13.0),
+    )
+    .fill(if DARK_MODE.load(Ordering::Relaxed) {
+        PANEL2
+    } else {
+        Color32::from_rgb(226, 232, 240)
+    })
+    .stroke(Stroke::new(1.0_f32, line()))
+    .corner_radius(CornerRadius::same(6))
+    .min_size(Vec2::new(0.0, 30.0))
 }
 
 pub fn danger_button(text: &str) -> egui::Button<'static> {
@@ -180,7 +269,7 @@ pub fn version_pill(ui: &mut Ui, text: &str) {
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new(title).color(TEXT).size(22.0).strong());
+            ui.label(RichText::new(title).color(foreground()).size(22.0).strong());
             if !subtitle.is_empty() {
                 ui.add_space(2.0);
                 ui.label(RichText::new(subtitle).color(MUTED).size(12.5));
@@ -207,12 +296,16 @@ pub fn nav_group_label(ui: &mut Ui, text: &str) {
 
 pub fn nav_item(ui: &mut Ui, selected: bool, icon: &str, text: &str) -> egui::Response {
     let (fill, fg) = if selected {
-        (
-            Color32::from_rgba_unmultiplied(45, 168, 196, 28),
-            ACCENT,
-        )
+        (Color32::from_rgba_unmultiplied(45, 168, 196, 28), ACCENT)
     } else {
-        (Color32::TRANSPARENT, Color32::from_rgb(203, 213, 225))
+        (
+            Color32::TRANSPARENT,
+            if DARK_MODE.load(Ordering::Relaxed) {
+                Color32::from_rgb(203, 213, 225)
+            } else {
+                Color32::from_rgb(51, 65, 85)
+            },
+        )
     };
 
     let resp = ui.add(
@@ -291,7 +384,8 @@ pub fn drive_usage_bar(ui: &mut Ui, ratio: f32, width: f32) {
     ui.painter()
         .rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(40, 52, 72));
     if ratio > 0.0 {
-        let fill = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * ratio, rect.height()));
+        let fill =
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * ratio, rect.height()));
         ui.painter().rect_filled(fill, CornerRadius::same(3), color);
     }
 }
@@ -303,7 +397,8 @@ pub fn size_bar(ui: &mut Ui, ratio: f32, width: f32) {
     ui.painter()
         .rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(40, 52, 72));
     if ratio > 0.0 {
-        let fill = egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * ratio, rect.height()));
+        let fill =
+            egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * ratio, rect.height()));
         ui.painter().rect_filled(
             fill,
             CornerRadius::same(3),
@@ -317,12 +412,7 @@ pub fn table_header_cell(ui: &mut Ui, text: &str, width: f32) {
         Vec2::new(width, 28.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.label(
-                RichText::new(text)
-                    .color(MUTED)
-                    .size(11.5)
-                    .strong(),
-            );
+            ui.label(RichText::new(text).color(MUTED).size(11.5).strong());
         },
     );
 }
@@ -330,7 +420,7 @@ pub fn table_header_cell(ui: &mut Ui, text: &str, width: f32) {
 pub fn empty_state(ui: &mut Ui, title: &str, hint: &str) {
     ui.vertical_centered(|ui| {
         ui.add_space(48.0);
-        ui.label(RichText::new(title).color(TEXT).size(16.0).strong());
+        ui.label(RichText::new(title).color(foreground()).size(16.0).strong());
         ui.add_space(6.0);
         ui.label(RichText::new(hint).color(MUTED).size(13.0));
         ui.add_space(24.0);

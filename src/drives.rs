@@ -94,9 +94,8 @@ pub fn list_drive_infos() -> Vec<DriveInfo> {
         let mut avail = 0u64;
         let mut total = 0u64;
         let mut free = 0u64;
-        let ok = unsafe {
-            GetDiskFreeSpaceExW(root_w.as_mut_ptr(), &mut avail, &mut total, &mut free)
-        };
+        let ok =
+            unsafe { GetDiskFreeSpaceExW(root_w.as_mut_ptr(), &mut avail, &mut total, &mut free) };
         if ok == 0 || total == 0 {
             continue;
         }

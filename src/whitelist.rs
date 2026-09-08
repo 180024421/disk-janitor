@@ -2,7 +2,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -20,21 +19,11 @@ impl LeftoverWhitelist {
     }
 
     pub fn load() -> Self {
-        let p = Self::path();
-        if let Ok(s) = fs::read_to_string(&p) {
-            serde_json::from_str(&s).unwrap_or_default()
-        } else {
-            Self::default()
-        }
+        crate::persistence::load_json(&Self::path()).unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path();
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(p, s).map_err(|e| e.to_string())
+        crate::persistence::save_json(&Self::path(), self, true)
     }
 
     pub fn set(&self) -> HashSet<String> {
@@ -74,9 +63,7 @@ pub fn filter_whitelisted(
     hits: Vec<crate::leftovers::LeftoverHit>,
     wl: &LeftoverWhitelist,
 ) -> Vec<crate::leftovers::LeftoverHit> {
-    hits.into_iter()
-        .filter(|h| !wl.contains(&h.path))
-        .collect()
+    hits.into_iter().filter(|h| !wl.contains(&h.path)).collect()
 }
 
 fn norm_key(path: &Path) -> String {

@@ -73,14 +73,19 @@ pub fn show_treemap(
         }
         let hover = resp.hover_pos().map(|p| r.contains(p)).unwrap_or(false);
         if hover {
-            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new(("tm", i)), |ui| {
-                ui.label(&e.name);
-                ui.label(format_bytes(e.size));
-                ui.weak(format!("{:.1}%", e.size as f64 * 100.0 / total as f64));
-                if e.is_dir {
-                    ui.weak("点击进入");
-                }
-            });
+            egui::show_tooltip_at_pointer(
+                ui.ctx(),
+                ui.layer_id(),
+                egui::Id::new(("tm", i)),
+                |ui| {
+                    ui.label(&e.name);
+                    ui.label(format_bytes(e.size));
+                    ui.weak(format!("{:.1}%", e.size as f64 * 100.0 / total as f64));
+                    if e.is_dir {
+                        ui.weak("点击进入");
+                    }
+                },
+            );
         }
     }
     click
@@ -108,7 +113,11 @@ fn squarify(sizes: &[u64], rect: Rect, out: &mut Vec<(Rect, usize)>) {
     let total: u64 = sizes.iter().sum::<u64>().max(1);
     let horizontal = rect.width() >= rect.height();
     let mut cursor = if horizontal { rect.left() } else { rect.top() };
-    let end = if horizontal { rect.right() } else { rect.bottom() };
+    let end = if horizontal {
+        rect.right()
+    } else {
+        rect.bottom()
+    };
     let span = (end - cursor).max(1.0);
 
     for (i, &sz) in sizes.iter().enumerate() {

@@ -52,6 +52,9 @@ if exist "resources" (
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\write-app-update.ps1" -Version "%VER%" -VersionCode %CODE%
 if errorlevel 1 exit /b 1
+powershell -NoProfile -Command ^
+  "$m = Get-Content -Raw 'deploy\app-update.json' | ConvertFrom-Json; if ($m.desktopUrl -notmatch '^https://') { throw 'manifest desktopUrl must use HTTPS' }; if ($m.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'manifest SHA256 must be 64 lowercase hex characters' }; if ((Get-Item 'release\DiskJanitor-%VER%.exe').Length -gt 300MB) { throw 'update payload exceeds 300 MB' }"
+if errorlevel 1 exit /b 1
 
 echo.
 echo [OK] release\DiskJanitor-%VER%.exe

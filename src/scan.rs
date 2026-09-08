@@ -1,6 +1,6 @@
 //! 并行扫盘引擎（支持增量快照；跳过目录可估算占用；可续扫 / 强制展开；排除列表 / 极速）
 
-use crate::model::{format_bytes, FsEntry, ScanIndex};
+use crate::model::{format_bytes, EstimateQuality, FsEntry, ScanIndex};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -38,10 +38,7 @@ impl ExcludeSet {
         let prefixes = excludes
             .iter()
             .filter_map(|ex| {
-                let mut ek = ex
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-                    .replace('/', "\\");
+                let mut ek = ex.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
                 while ek.ends_with('\\') {
                     ek.pop();
                 }
@@ -116,6 +113,9 @@ enum SkipKind {
     CountOnly,
 }
 
+const PARTIAL_MIN_NEW_ENTRIES: usize = 2_048;
+const PARTIAL_MAX_SILENCE: Duration = Duration::from_secs(45);
+
 /// 全新扫描（默认选项）
 pub fn scan_path<F>(root: PathBuf, cancel: Arc<AtomicBool>, on_event: F) -> ScanIndex
 where
@@ -164,6 +164,7 @@ where
     if !root.exists() {
         let msg = format!("路径不存在: {}", root.display());
         index.errors.push(msg.clone());
+        index.quality = EstimateQuality::Unavailable;
         on_event(ScanEvent::Progress(ScanProgress {
             visited: 0,
             skipped: 0,
@@ -254,16 +255,20 @@ where
                 });
             }
         }
-        let snap = finish_counts(build_index(
-            index.clone(),
-            &raws,
-            &root,
-            skipped0,
-            skipped_bytes0,
-            &skipped_notes,
-            true,
-        ));
-        on_event(ScanEvent::Partial(snap));
+        // 小目录通常会立即完成，提前构建完整索引只会制造一次重复峰值。
+        // 仅在根目录已显示出较大工作量时提供首个可浏览快照。
+        if should_emit_initial_partial(raws.len(), stack.len()) {
+            let snap = finish_counts(build_index(
+                index.clone(),
+                &raws,
+                &root,
+                skipped0,
+                skipped_bytes0,
+                &skipped_notes,
+                true,
+            ));
+            on_event(ScanEvent::Partial(snap));
+        }
     }
 
     run_scan_loop(
@@ -385,7 +390,10 @@ where
             r.file_size = 0;
         }
     }
-    if !raws.iter().any(|r| ScanIndex::key_norm(&r.path) == expand_key) {
+    if !raws
+        .iter()
+        .any(|r| ScanIndex::key_norm(&r.path) == expand_key)
+    {
         if let Ok(meta) = std::fs::metadata(&expand_dir) {
             raws.push(Raw {
                 path: expand_dir.clone(),
@@ -470,6 +478,7 @@ where
 {
     let mut last_ui = Instant::now();
     let mut last_partial = Instant::now();
+    let mut last_partial_entries = raws.len();
     let quick_lim = opts.quick_limit();
     let turbo = opts.turbo;
     let excludes = ExcludeSet::new(&opts.excludes);
@@ -526,9 +535,8 @@ where
         let chunk: Vec<Raw> = children
             .par_iter()
             .filter_map(|path| {
-                if cancel.load(Ordering::Relaxed) {
-                    return None;
-                }
+                // 当前目录已经出栈；即使此时收到取消，也应登记完这一批，
+                // 否则被跳过的子目录无法进入 resume_stack。
                 if excludes_ref.contains(path) {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return None;
@@ -626,17 +634,9 @@ where
         }
 
         let n = raws.len();
-        let interval = if n > 120_000 {
-            Duration::from_secs(20)
-        } else if n > 80_000 {
-            Duration::from_secs(10)
-        } else if n > 20_000 {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(3)
-        };
-        if last_partial.elapsed() >= interval {
+        if should_emit_partial(n, last_partial_entries, last_partial.elapsed()) {
             last_partial = Instant::now();
+            last_partial_entries = n;
             let skipped_n = skipped.load(Ordering::Relaxed);
             let sb = skipped_bytes.load(Ordering::Relaxed);
             let snap = finish_counts(build_index(
@@ -685,10 +685,42 @@ where
     done
 }
 
+fn should_emit_initial_partial(entries: usize, pending_dirs: usize) -> bool {
+    pending_dirs > 0 && (entries >= 2_000 || pending_dirs >= 64)
+}
+
+fn should_emit_partial(entries: usize, previous_entries: usize, elapsed: Duration) -> bool {
+    let new_entries = entries.saturating_sub(previous_entries);
+    if new_entries == 0 {
+        return false;
+    }
+    let interval = if entries > 120_000 {
+        Duration::from_secs(30)
+    } else if entries > 80_000 {
+        Duration::from_secs(20)
+    } else if entries > 20_000 {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(5)
+    };
+    let proportional_growth = previous_entries / 10;
+    let meaningful_growth = PARTIAL_MIN_NEW_ENTRIES.max(proportional_growth);
+    elapsed >= interval && (new_entries >= meaningful_growth || elapsed >= PARTIAL_MAX_SILENCE)
+}
+
 fn finish_counts(mut index: ScanIndex) -> ScanIndex {
     index.rebuild_children();
     index.file_count = index.entries.values().filter(|e| !e.is_dir).count() as u64;
     index.dir_count = index.entries.values().filter(|e| e.is_dir).count() as u64;
+    index.quality = if index.partial {
+        EstimateQuality::Estimated
+    } else if !index.errors.is_empty() {
+        EstimateQuality::PermissionLimited
+    } else if index.skipped_bytes > 0 {
+        EstimateQuality::Estimated
+    } else {
+        EstimateQuality::Complete
+    };
     index
 }
 
@@ -789,11 +821,22 @@ fn build_index(
 }
 
 pub fn quick_dir_size(path: &Path, cancel: &AtomicBool, max_files: u64) -> (u64, u64) {
+    let (bytes, files, _) = quick_dir_size_with_status(path, cancel, max_files);
+    (bytes, files)
+}
+
+pub fn quick_dir_size_with_status(
+    path: &Path,
+    cancel: &AtomicBool,
+    max_files: u64,
+) -> (u64, u64, bool) {
     let mut total = 0u64;
     let mut files = 0u64;
     let mut stack = vec![path.to_path_buf()];
+    let mut complete = true;
     while let Some(dir) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
+            complete = false;
             break;
         }
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -801,7 +844,8 @@ pub fn quick_dir_size(path: &Path, cancel: &AtomicBool, max_files: u64) -> (u64,
         };
         for ent in rd.flatten() {
             if cancel.load(Ordering::Relaxed) || files >= max_files {
-                return (total, files);
+                complete = false;
+                return (total, files, complete);
             }
             let p = ent.path();
             let Ok(meta) = std::fs::symlink_metadata(&p) else {
@@ -818,7 +862,7 @@ pub fn quick_dir_size(path: &Path, cancel: &AtomicBool, max_files: u64) -> (u64,
             }
         }
     }
-    (total, files)
+    (total, files, complete)
 }
 
 #[cfg(test)]
@@ -910,5 +954,61 @@ mod tests {
         assert!(!set.contains(Path::new(r"C:\Users\FooBar")));
         // 正斜杠也应规范化
         assert!(set.contains(Path::new("C:/Users/Foo/x")));
+    }
+
+    #[test]
+    fn partial_snapshots_require_time_and_meaningful_growth() {
+        assert!(!should_emit_partial(
+            20_000,
+            20_000,
+            Duration::from_secs(60)
+        ));
+        assert!(!should_emit_partial(
+            21_000,
+            20_000,
+            Duration::from_secs(10)
+        ));
+        assert!(should_emit_partial(23_000, 20_000, Duration::from_secs(10)));
+        assert!(should_emit_partial(20_100, 20_000, PARTIAL_MAX_SILENCE));
+    }
+
+    #[test]
+    fn small_root_does_not_build_redundant_initial_snapshot() {
+        assert!(!should_emit_initial_partial(20, 3));
+        assert!(should_emit_initial_partial(2_000, 1));
+        assert!(should_emit_initial_partial(100, 64));
+    }
+
+    #[test]
+    fn cancelled_scan_resumes_all_pending_directories_in_temp_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("a.txt"), b"a").unwrap();
+        fs::write(b.join("b.txt"), b"bb").unwrap();
+
+        let paused = scan_path(
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(true)),
+            |_| {},
+        );
+        assert!(paused.partial);
+        assert_eq!(paused.resume_stack.len(), 2);
+
+        let remaining = paused.resume_stack.clone();
+        let resumed = resume_scan(
+            dir.path().to_path_buf(),
+            paused,
+            remaining,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert!(!resumed.partial);
+        assert!(resumed.resume_stack.is_empty());
+        assert_eq!(resumed.get(dir.path()).unwrap().size, 3);
+        assert!(resumed.get(&a.join("a.txt")).is_some());
+        assert!(resumed.get(&b.join("b.txt")).is_some());
     }
 }

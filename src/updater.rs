@@ -9,6 +9,7 @@ use std::process::Command;
 pub const APP_VERSION_NAME: &str = env!("CARGO_PKG_VERSION");
 include!(concat!(env!("OUT_DIR"), "/version_code.rs"));
 pub const APP_KEY: &str = "disk-janitor";
+pub const MAX_UPDATE_BYTES: u64 = 300 * 1024 * 1024;
 /// 与 DeskReader 一致：花生壳 HTTPS → Nginx → jiaoben（勿带 :8687）
 pub const DEFAULT_API_BASE: &str = "https://1ph1hf8043323.vicp.fun";
 
@@ -54,6 +55,11 @@ impl RemoteManifest {
     }
 }
 
+/// 清单签名验证扩展点。staged 版本传入 `None`，后续可注入强制签名验证实现。
+pub trait ManifestSignatureVerifier {
+    fn verify(&self, manifest: &RemoteManifest) -> Result<(), String>;
+}
+
 #[derive(Debug, Clone)]
 pub enum UpdateCheck {
     UpToDate,
@@ -71,6 +77,12 @@ pub struct AppConfig {
     /// UI 缩放（1.0 / 1.15 / 1.3）
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// "system" | "dark" | "light"
+    #[serde(default = "default_theme_mode")]
+    pub theme_mode: String,
+    /// "comfortable" | "compact"
+    #[serde(default = "default_ui_density")]
+    pub ui_density: String,
     /// 上次扫描根路径（便于继续扫）
     #[serde(default)]
     pub last_scan_root: String,
@@ -120,6 +132,14 @@ fn default_ui_scale() -> f32 {
     1.0
 }
 
+fn default_theme_mode() -> String {
+    "system".into()
+}
+
+fn default_ui_density() -> String {
+    "comfortable".into()
+}
+
 fn default_dup_min_mb() -> u64 {
     1
 }
@@ -142,6 +162,8 @@ impl Default for AppConfig {
             update_api_base: DEFAULT_API_BASE.to_string(),
             check_on_start: true,
             ui_scale: 1.0,
+            theme_mode: default_theme_mode(),
+            ui_density: default_ui_density(),
             last_scan_root: String::new(),
             last_scan_summary: String::new(),
             dup_keep_strategy: crate::duplicates::KeepStrategy::PreferNotDownloads,
@@ -168,11 +190,7 @@ impl AppConfig {
 
     pub fn load() -> Self {
         let p = Self::path();
-        let mut cfg = if let Ok(s) = fs::read_to_string(&p) {
-            serde_json::from_str(&s).unwrap_or_default()
-        } else {
-            Self::default()
-        };
+        let mut cfg = crate::persistence::load_json(&p).unwrap_or_default();
         cfg.normalize();
         cfg
     }
@@ -183,6 +201,16 @@ impl AppConfig {
         } else {
             self.ui_scale = self.ui_scale.clamp(0.85, 2.0);
         }
+        self.theme_mode = match self.theme_mode.trim().to_ascii_lowercase().as_str() {
+            "dark" => "dark".into(),
+            "light" => "light".into(),
+            _ => "system".into(),
+        };
+        self.ui_density = if self.ui_density.eq_ignore_ascii_case("compact") {
+            "compact".into()
+        } else {
+            "comfortable".into()
+        };
         if self.dup_min_mb == 0 {
             self.dup_min_mb = 1;
         }
@@ -235,12 +263,7 @@ impl AppConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let p = Self::path();
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(p, s).map_err(|e| e.to_string())
+        crate::persistence::save_json(&Self::path(), self, true)
     }
 }
 
@@ -316,7 +339,12 @@ fn fetch_one(url: &str) -> Result<Option<RemoteManifest>, String> {
     } else {
         &v
     };
-    Ok(parse_update_payload(payload))
+    let manifest = match parse_update_payload(payload) {
+        Some(manifest) => manifest,
+        None => return Ok(None),
+    };
+    validate_remote_manifest(&manifest, None)?;
+    Ok(Some(manifest))
 }
 
 fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
@@ -326,7 +354,10 @@ fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
     let version_code = v
         .get("versionCode")
         .or_else(|| v.get("androidVersionCode"))
-        .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
         .unwrap_or(0) as u32;
     let version_name = v
         .get("versionName")
@@ -427,14 +458,105 @@ pub fn version_newer(remote: &str, local: &str) -> bool {
 
 pub fn open_url(url: &str) -> Result<(), String> {
     let url = url.trim();
-    if url.is_empty() {
-        return Err("下载地址为空".into());
-    }
+    validate_https_url(url)?;
     Command::new("cmd")
         .args(["/C", "start", "", url])
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub fn validate_https_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if !url
+        .get(.."https://".len())
+        .map(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        .unwrap_or(false)
+        || url.len() <= "https://".len()
+    {
+        return Err("更新下载地址必须是 HTTPS URL".into());
+    }
+    let authority = url[8..].split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains(char::is_whitespace) {
+        return Err("更新下载地址不是合法的 HTTPS URL".into());
+    }
+    Ok(())
+}
+
+pub fn validate_sha256(value: &str) -> Result<String, String> {
+    let hash = value.trim();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("远程更新必须提供合法的 64 位十六进制 SHA256".into());
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
+pub fn validate_remote_manifest(
+    manifest: &RemoteManifest,
+    signature_verifier: Option<&dyn ManifestSignatureVerifier>,
+) -> Result<(), String> {
+    validate_https_url(&manifest.url)?;
+    validate_sha256(&manifest.sha256)?;
+    if let Some(verifier) = signature_verifier {
+        verifier.verify(manifest)?;
+    }
+    Ok(())
+}
+
+fn is_allowed_binary_content_type(value: Option<&str>) -> bool {
+    let media_type = value
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        media_type.as_str(),
+        "application/octet-stream"
+            | "binary/octet-stream"
+            | "application/x-msdownload"
+            | "application/x-msdos-program"
+            | "application/vnd.microsoft.portable-executable"
+            | "application/x-executable"
+    )
+}
+
+fn checked_download_size(current: u64, chunk: usize) -> Result<u64, String> {
+    let next = current
+        .checked_add(chunk as u64)
+        .ok_or_else(|| "更新文件大小溢出".to_string())?;
+    if next > MAX_UPDATE_BYTES {
+        return Err(format!(
+            "更新文件超过最大限制 {} MB",
+            MAX_UPDATE_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(next)
+}
+
+fn validate_content_length(length: u64) -> Result<(), String> {
+    if length > MAX_UPDATE_BYTES {
+        return Err(format!(
+            "更新文件超过最大限制 {} MB",
+            MAX_UPDATE_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
+fn write_limited<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64, String> {
+    let mut total = 0u64;
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total = checked_download_size(total, n)?;
+        writer.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    }
+    Ok(total)
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -451,15 +573,17 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// 下载到 exe 同目录的 disk-janitor.new.exe，校验 SHA256（若清单提供），并启动替换脚本
+/// 下载到 exe 同目录临时文件，校验 SHA256，并启动带备份、失败回滚的替换脚本。
 pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
-    if manifest.url.trim().is_empty() {
-        return Err("远程未提供 desktopUrl".into());
-    }
+    validate_remote_manifest(manifest, None)?;
+    let expected_sha256 = validate_sha256(&manifest.sha256)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    let new_path = dir.join("disk-janitor.new.exe");
+    let nonce = format!("{}-{}", std::process::id(), manifest.version_code);
+    let new_name = format!("disk-janitor.{nonce}.new.exe");
+    let new_path = dir.join(&new_name);
     let script = dir.join("disk-janitor-apply-update.cmd");
+    let restore_script = dir.join("disk-janitor-restore-previous.cmd");
 
     let resp = ureq::get(manifest.url.trim())
         .set(
@@ -468,40 +592,93 @@ pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
         )
         .call()
         .map_err(|e| format!("下载失败: {e}"))?;
+    validate_https_url(resp.get_url())?;
+    if !is_allowed_binary_content_type(resp.header("Content-Type")) {
+        return Err(format!(
+            "更新响应 Content-Type 不受支持: {}",
+            resp.header("Content-Type").unwrap_or("<missing>")
+        ));
+    }
+    if let Some(length) = resp
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        validate_content_length(length)?;
+    }
     let mut reader = resp.into_reader();
-    let mut file = fs::File::create(&new_path).map_err(|e| e.to_string())?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&new_path)
+        .map_err(|e| format!("无法在程序目录创建更新临时文件: {e}"))?;
+    if let Err(e) = write_limited(&mut reader, &mut file) {
+        drop(file);
+        let _ = fs::remove_file(&new_path);
+        return Err(e);
+    }
     file.flush().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
     drop(file);
 
-    if !manifest.sha256.is_empty() {
-        let got = sha256_file(&new_path)?;
-        let expect = manifest.sha256.trim().to_ascii_lowercase();
-        if got != expect {
-            let _ = fs::remove_file(&new_path);
-            return Err(format!(
-                "SHA256 校验失败：期望 {expect}，实际 {got}。已删除损坏文件。"
-            ));
-        }
+    let got = sha256_file(&new_path)?;
+    if got != expected_sha256 {
+        let _ = fs::remove_file(&new_path);
+        return Err(format!(
+            "SHA256 校验失败：期望 {expected_sha256}，实际 {got}。已删除损坏文件。"
+        ));
     }
 
     let exe_name = exe
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("disk-janitor.exe");
+    let backup_name = format!("{exe_name}.previous");
+    let restore_body = format!(
+        "@echo off\r\n\
+         chcp 65001 >nul\r\n\
+         if not exist \"%~dp0{backup_name}\" (\r\n\
+           echo 未找到旧版本备份：%~dp0{backup_name}\r\n\
+           pause\r\n\
+           exit /b 1\r\n\
+         )\r\n\
+         taskkill /f /im \"{exe_name}\" >nul 2>&1\r\n\
+         timeout /t 1 /nobreak >nul\r\n\
+         if exist \"%~dp0{exe_name}.failed\" del /f /q \"%~dp0{exe_name}.failed\"\r\n\
+         if exist \"%~dp0{exe_name}\" move /y \"%~dp0{exe_name}\" \"%~dp0{exe_name}.failed\" >nul\r\n\
+         move /y \"%~dp0{backup_name}\" \"%~dp0{exe_name}\" >nul\r\n\
+         if errorlevel 1 (\r\n\
+           echo 恢复失败，备份仍位于：%~dp0{backup_name}\r\n\
+           pause\r\n\
+           exit /b 2\r\n\
+         )\r\n\
+         start \"\" \"%~dp0{exe_name}\"\r\n\
+         echo 已恢复旧版本。\r\n"
+    );
+    fs::write(&restore_script, restore_body).map_err(|e| e.to_string())?;
     let body = format!(
         "@echo off\r\n\
          chcp 65001 >nul\r\n\
          echo 正在应用更新…\r\n\
          timeout /t 2 /nobreak >nul\r\n\
-         move /y \"%~dp0disk-janitor.new.exe\" \"%~dp0{exe_name}\"\r\n\
-         if errorlevel 1 (\r\n\
-           echo 替换失败，请手动把 disk-janitor.new.exe 改名为 {exe_name}\r\n\
-           pause\r\n\
-           exit /b 1\r\n\
-         )\r\n\
+         if exist \"%~dp0{backup_name}\" del /f /q \"%~dp0{backup_name}\"\r\n\
+         move /y \"%~dp0{exe_name}\" \"%~dp0{backup_name}\" >nul\r\n\
+         if errorlevel 1 goto rollback_failed\r\n\
+         move /y \"%~dp0{new_name}\" \"%~dp0{exe_name}\" >nul\r\n\
+         if errorlevel 1 goto rollback\r\n\
          start \"\" \"%~dp0{exe_name}\"\r\n\
-         del \"%~f0\"\r\n"
+         del \"%~f0\"\r\n\
+         exit /b 0\r\n\
+         :rollback\r\n\
+         move /y \"%~dp0{backup_name}\" \"%~dp0{exe_name}\" >nul\r\n\
+         if errorlevel 1 goto rollback_failed\r\n\
+         echo 更新失败，已恢复旧版本。\r\n\
+         start \"\" \"%~dp0{exe_name}\"\r\n\
+         pause\r\n\
+         exit /b 1\r\n\
+         :rollback_failed\r\n\
+         echo 更新失败且自动恢复失败。旧版本备份位于：%~dp0{backup_name}\r\n\
+         pause\r\n\
+         exit /b 2\r\n"
     );
     fs::write(&script, body).map_err(|e| e.to_string())?;
 
@@ -510,15 +687,10 @@ pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
 
-    let verify = if manifest.sha256.is_empty() {
-        "（清单未提供 sha256，已跳过校验）"
-    } else {
-        "（SHA256 已校验）"
-    };
     Ok(format!(
-        "已下载 {} {}，即将重启替换。请保存工作后关闭本窗口。",
+        "已下载 {}（SHA256 已校验），即将重启替换。旧版本将保留为 {}。",
         manifest.label(),
-        verify
+        backup_name
     ))
 }
 
@@ -540,41 +712,44 @@ mod tests {
         let by_code = RemoteManifest {
             version_code: APP_VERSION_CODE + 1,
             version_name: APP_VERSION_NAME.to_string(),
-            url: "http://x/a.exe".into(),
+            url: "https://x/a.exe".into(),
             changelog: String::new(),
-            sha256: String::new(),
+            sha256: "a".repeat(64),
         };
         assert!(need_update(&by_code));
 
         let same = RemoteManifest {
             version_code: APP_VERSION_CODE,
             version_name: APP_VERSION_NAME.to_string(),
-            url: "http://x/a.exe".into(),
+            url: "https://x/a.exe".into(),
             changelog: String::new(),
-            sha256: String::new(),
+            sha256: "b".repeat(64),
         };
         assert!(!need_update(&same));
     }
 
     #[test]
     fn parses_jiaoben_style_manifest() {
-        let j = r#"{"versionCode":5,"versionName":"0.3.0","desktopUrl":"http://x/a.exe","changelog":"fix","sha256":"abc"}"#;
-        let v: serde_json::Value = serde_json::from_str(j).unwrap();
+        let j = format!(
+            r#"{{"versionCode":5,"versionName":"0.3.0","desktopUrl":"https://x/a.exe","changelog":"fix","sha256":"{}"}}"#,
+            "a".repeat(64)
+        );
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         let m = parse_update_payload(&v).unwrap();
         assert_eq!(m.version_code, 5);
         assert_eq!(m.version_name, "0.3.0");
-        assert_eq!(m.url, "http://x/a.exe");
-        assert_eq!(m.sha256, "abc");
+        assert_eq!(m.url, "https://x/a.exe");
+        assert_eq!(m.sha256, "a".repeat(64));
     }
 
     #[test]
     fn parses_wrapped_data() {
-        let j = r#"{"code":200,"data":{"versionCode":2,"versionName":"0.2.0","desktopUrl":"http://y/b.exe"}}"#;
+        let j = r#"{"code":200,"data":{"versionCode":2,"versionName":"0.2.0","desktopUrl":"https://y/b.exe"}}"#;
         let v: serde_json::Value = serde_json::from_str(j).unwrap();
         let payload = &v["data"];
         let m = parse_update_payload(payload).unwrap();
         assert_eq!(m.version_code, 2);
-        assert_eq!(m.url, "http://y/b.exe");
+        assert_eq!(m.url, "https://y/b.exe");
     }
 
     #[test]
@@ -615,5 +790,62 @@ mod tests {
         };
         c.normalize();
         assert_eq!(c.update_api_base, "http://h:8687");
+    }
+
+    #[test]
+    fn validates_https_url_and_sha256() {
+        assert!(validate_https_url("https://example.test/update.exe").is_ok());
+        assert!(validate_https_url("HTTPS://example.test/update.exe").is_ok());
+        assert!(validate_https_url("http://example.test/update.exe").is_err());
+        assert!(validate_https_url("https://").is_err());
+        assert!(validate_sha256(&"aF".repeat(32)).is_ok());
+        assert!(validate_sha256(&"a".repeat(63)).is_err());
+        assert!(validate_sha256(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn validates_manifest_with_optional_signature_verifier() {
+        struct Reject;
+        impl ManifestSignatureVerifier for Reject {
+            fn verify(&self, _: &RemoteManifest) -> Result<(), String> {
+                Err("bad signature".into())
+            }
+        }
+        let manifest = RemoteManifest {
+            version_code: 1,
+            version_name: "1.0.0".into(),
+            url: "https://example.test/update.exe".into(),
+            changelog: String::new(),
+            sha256: "c".repeat(64),
+        };
+        assert!(validate_remote_manifest(&manifest, None).is_ok());
+        assert!(validate_remote_manifest(&manifest, Some(&Reject)).is_err());
+    }
+
+    #[test]
+    fn enforces_download_size_limit_logic() {
+        assert_eq!(
+            checked_download_size(MAX_UPDATE_BYTES - 1, 1).unwrap(),
+            MAX_UPDATE_BYTES
+        );
+        assert!(checked_download_size(MAX_UPDATE_BYTES, 1).is_err());
+        assert!(validate_content_length(MAX_UPDATE_BYTES).is_ok());
+        assert!(validate_content_length(MAX_UPDATE_BYTES + 1).is_err());
+        let mut source = std::io::Cursor::new(vec![1u8; 1024]);
+        let mut target = Vec::new();
+        assert_eq!(write_limited(&mut source, &mut target).unwrap(), 1024);
+        assert_eq!(target.len(), 1024);
+    }
+
+    #[test]
+    fn accepts_only_expected_binary_content_types() {
+        assert!(is_allowed_binary_content_type(Some(
+            "application/octet-stream; charset=binary"
+        )));
+        assert!(is_allowed_binary_content_type(Some(
+            "application/vnd.microsoft.portable-executable"
+        )));
+        assert!(!is_allowed_binary_content_type(Some("text/html")));
+        assert!(!is_allowed_binary_content_type(None));
     }
 }

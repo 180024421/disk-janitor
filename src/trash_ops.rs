@@ -1,6 +1,8 @@
 //! 删除：优先进回收站；可选允许永久删除兜底；安全粉碎；回收站清空
 
 use crate::model::is_sensitive_path;
+use crate::operation_log;
+use crate::safety::{validate_delete_target, TargetState};
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -42,9 +44,18 @@ pub fn move_to_trash(paths: &[PathBuf]) -> TrashResult {
 pub fn move_to_trash_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashResult {
     let mut res = TrashResult::default();
     for p in paths {
-        if !p.exists() {
-            res.ok.push(p.clone());
-            continue;
+        match validate_delete_target(p) {
+            Ok(TargetState::Missing) => {
+                res.ok.push(p.clone());
+                operation_log::append("delete", p, "missing", "目标已不存在");
+                continue;
+            }
+            Ok(TargetState::Present) => {}
+            Err(e) => {
+                operation_log::append("delete", p, "blocked", &e);
+                res.failed.push((p.clone(), e));
+                continue;
+            }
         }
         if opts.shred {
             if p.is_file() {
@@ -53,19 +64,24 @@ pub fn move_to_trash_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashResult
                         res.ok.push(p.clone());
                         res.shredded += 1;
                         res.permanent += 1;
+                        operation_log::append("shred", p, "permanent", "安全粉碎后删除");
                     }
-                    Err(e) => res.failed.push((p.clone(), e)),
+                    Err(e) => {
+                        operation_log::append("shred", p, "failed", &e);
+                        res.failed.push((p.clone(), e));
+                    }
                 }
             } else {
-                res.failed.push((
-                    p.clone(),
-                    "安全粉碎仅支持文件（目录请先展开或改用不粉碎删除）".into(),
-                ));
+                let error = "安全粉碎仅支持文件（目录请先展开或改用不粉碎删除）";
+                operation_log::append("shred", p, "blocked", error);
+                res.failed.push((p.clone(), error.into()));
             }
             continue;
         }
-        match delete_with_fallback(p, opts.allow_permanent) {
-            DeleteOutcome::Recycled => res.ok.push(p.clone()),
+        let outcome = delete_with_fallback(p, opts.allow_permanent);
+        record_delete_outcome(p, &outcome);
+        match outcome {
+            DeleteOutcome::Recycled | DeleteOutcome::Missing => res.ok.push(p.clone()),
             DeleteOutcome::Permanent => {
                 res.ok.push(p.clone());
                 res.permanent += 1;
@@ -85,6 +101,7 @@ pub fn move_to_trash_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashResult
 
 /// 覆写文件内容（零 / 伪随机）后永久删除。
 pub fn shred_file(path: &Path, passes: u8) -> Result<(), String> {
+    validate_delete_target(path)?;
     if !path.is_file() {
         return Err("不是普通文件".into());
     }
@@ -115,9 +132,7 @@ pub fn shred_file(path: &Path, passes: u8) -> Result<(), String> {
                 let mut x = (len ^ (pass as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
                     .wrapping_add(0xA5A5_5A5A);
                 for b in buf.iter_mut() {
-                    x = x
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1);
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
                     *b = (x >> 33) as u8;
                 }
             }
@@ -137,11 +152,17 @@ pub fn shred_file(path: &Path, passes: u8) -> Result<(), String> {
 enum DeleteOutcome {
     Recycled,
     Permanent,
+    Missing,
     Locked,
     Failed(String),
 }
 
 fn delete_with_fallback(p: &Path, allow_permanent: bool) -> DeleteOutcome {
+    match validate_delete_target(p) {
+        Ok(TargetState::Missing) => return DeleteOutcome::Missing,
+        Ok(TargetState::Present) => {}
+        Err(e) => return DeleteOutcome::Failed(e),
+    }
     if trash::delete(p).is_ok() {
         return DeleteOutcome::Recycled;
     }
@@ -215,7 +236,7 @@ pub fn clean_junk_paths(paths: &[PathBuf]) -> TrashResult {
     clean_junk_paths_with(
         paths,
         DeleteOptions {
-            allow_permanent: true,
+            allow_permanent: false,
             shred: false,
         },
     )
@@ -231,8 +252,14 @@ pub fn clean_junk_paths_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashRes
         if !seen.insert(key) {
             continue;
         }
-        if !p.exists() {
-            continue;
+        match validate_delete_target(&p) {
+            Ok(TargetState::Missing) => continue,
+            Ok(TargetState::Present) => {}
+            Err(e) => {
+                operation_log::append("clean-junk", &p, "blocked", &e);
+                res.failed.push((p, e));
+                continue;
+            }
         }
         if p.is_file() {
             if opts.shred {
@@ -241,8 +268,17 @@ pub fn clean_junk_paths_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashRes
                         res.ok.push(p.clone());
                         res.shredded += 1;
                         res.permanent += 1;
+                        operation_log::append(
+                            "clean-junk-shred",
+                            &p,
+                            "permanent",
+                            "安全粉碎后删除",
+                        );
                     }
-                    Err(e) => res.failed.push((p, e)),
+                    Err(e) => {
+                        operation_log::append("clean-junk-shred", &p, "failed", &e);
+                        res.failed.push((p, e));
+                    }
                 }
             } else {
                 apply_outcome(delete_with_fallback(&p, opts.allow_permanent), &p, &mut res);
@@ -257,18 +293,32 @@ pub fn clean_junk_paths_with(paths: &[PathBuf], opts: DeleteOptions) -> TrashRes
 }
 
 fn apply_outcome(o: DeleteOutcome, p: &Path, res: &mut TrashResult) {
+    record_delete_outcome(p, &o);
     match o {
-        DeleteOutcome::Recycled => res.ok.push(p.to_path_buf()),
+        DeleteOutcome::Recycled | DeleteOutcome::Missing => res.ok.push(p.to_path_buf()),
         DeleteOutcome::Permanent => {
             res.ok.push(p.to_path_buf());
             res.permanent += 1;
         }
         DeleteOutcome::Locked => {
             res.skipped_locked += 1;
-            res.failed
-                .push((p.to_path_buf(), "占用中，已跳过".into()));
+            res.failed.push((p.to_path_buf(), "占用中，已跳过".into()));
         }
         DeleteOutcome::Failed(msg) => res.failed.push((p.to_path_buf(), msg)),
+    }
+}
+
+fn record_delete_outcome(path: &Path, outcome: &DeleteOutcome) {
+    match outcome {
+        DeleteOutcome::Recycled => {
+            operation_log::append("delete", path, "recycled", "已移入回收站")
+        }
+        DeleteOutcome::Permanent => {
+            operation_log::append("delete", path, "permanent", "回收站失败后直接删除")
+        }
+        DeleteOutcome::Missing => operation_log::append("delete", path, "missing", "目标已不存在"),
+        DeleteOutcome::Locked => operation_log::append("delete", path, "locked", "文件占用中"),
+        DeleteOutcome::Failed(error) => operation_log::append("delete", path, "failed", error),
     }
 }
 
@@ -278,8 +328,7 @@ fn clean_dir_contents(dir: &Path, res: &mut TrashResult, depth: u32, allow_perma
         return;
     }
     let Ok(rd) = fs::read_dir(dir) else {
-        res.failed
-            .push((dir.to_path_buf(), "无法读取目录".into()));
+        res.failed.push((dir.to_path_buf(), "无法读取目录".into()));
         return;
     };
     for ent in rd.flatten() {
@@ -329,18 +378,16 @@ pub fn format_trash_errors(res: &TrashResult, limit: usize) -> String {
         lines.push(format!("已安全粉碎 {} 个文件", res.shredded));
     }
     if res.permanent > 0 {
-        lines.push(format!(
-            "其中 {} 项无法进回收站，已直接删除",
-            res.permanent
-        ));
+        lines.push(format!("其中 {} 项无法进回收站，已直接删除", res.permanent));
     }
     lines.join("\n")
 }
 
 /// 估算回收站占用（用户 SID 下 $Recycle.Bin）
-pub fn recycle_bin_size() -> Result<(u64, u64), String> {
+pub fn recycle_bin_size() -> Result<(u64, u64, bool), String> {
     let mut total = 0u64;
     let mut files = 0u64;
+    let mut complete = true;
     for letter in b'A'..=b'Z' {
         let bin = PathBuf::from(format!("{}:\\$Recycle.Bin", letter as char));
         if !bin.exists() {
@@ -352,17 +399,18 @@ pub fn recycle_bin_size() -> Result<(u64, u64), String> {
         for ent in rd.flatten() {
             let p = ent.path();
             if p.is_dir() {
-                let (sz, n) = crate::scan::quick_dir_size(
+                let (sz, n, item_complete) = crate::scan::quick_dir_size_with_status(
                     &p,
                     &std::sync::atomic::AtomicBool::new(false),
                     50_000,
                 );
                 total += sz;
                 files += n;
+                complete &= item_complete;
             }
         }
     }
-    Ok((total, files))
+    Ok((total, files, complete))
 }
 
 pub fn empty_recycle_bin() -> Result<String, String> {
