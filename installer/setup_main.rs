@@ -120,16 +120,24 @@ fn write_uninstall_script(dir: &Path) -> Result<(), String> {
 
 fn create_shortcuts(dir: &Path) -> Result<(), String> {
     let exe = dir.join(APP_EXE);
+    let icon = dir.join("resources").join("icon.ico");
+    let icon_path = if icon.exists() {
+        icon.display().to_string()
+    } else {
+        format!("{},0", exe.display())
+    };
     let ps = format!(
         "$ws = New-Object -ComObject WScript.Shell; \
          $s = $ws.CreateShortcut([IO.Path]::Combine($env:APPDATA, 'Microsoft\\Windows\\Start Menu\\Programs', '{APP_NAME}.lnk')); \
-         $s.TargetPath = '{}'; $s.WorkingDirectory = '{}'; $s.Description = '{APP_NAME}'; $s.Save(); \
+         $s.TargetPath = '{}'; $s.WorkingDirectory = '{}'; $s.Description = '{APP_NAME}'; $s.IconLocation = '{}'; $s.Save(); \
          $d = $ws.CreateShortcut([IO.Path]::Combine($env:USERPROFILE, 'Desktop', '{APP_NAME}.lnk')); \
-         $d.TargetPath = '{}'; $d.WorkingDirectory = '{}'; $d.Description = '{APP_NAME}'; $d.Save();",
+         $d.TargetPath = '{}'; $d.WorkingDirectory = '{}'; $d.Description = '{APP_NAME}'; $d.IconLocation = '{}'; $d.Save();",
         exe.display(),
         dir.display(),
+        icon_path,
         exe.display(),
-        dir.display()
+        dir.display(),
+        icon_path
     );
     let status = Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps])

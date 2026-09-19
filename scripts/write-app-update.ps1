@@ -18,7 +18,7 @@ if ((Get-Item $exe).Length -gt 300MB) { throw "update payload exceeds 300 MB" }
 
 $sha = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
 if ($sha -notmatch '^[0-9a-f]{64}$') { throw "invalid SHA256 generated for $exe" }
-$defaultUrl = "https://1ph1hf8043323.vicp.fun/api/files/app-update/disk-janitor/DiskJanitor-$Version.exe"
+$defaultUrl = "https://jiaoben.lidashuai.top/api/files/app-update/disk-janitor/DiskJanitor-$Version.exe"
 if ([string]::IsNullOrWhiteSpace($DownloadUrl)) { $DownloadUrl = $defaultUrl }
 $parsedUrl = $null
 if (-not [Uri]::TryCreate($DownloadUrl, [UriKind]::Absolute, [ref]$parsedUrl) -or

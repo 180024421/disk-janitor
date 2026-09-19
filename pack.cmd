@@ -14,6 +14,8 @@ if errorlevel 1 (
 echo === Dashuai Cleaner portable pack ===
 taskkill /F /IM disk-janitor.exe >nul 2>&1
 taskkill /F /IM DashuaiCleaner.exe >nul 2>&1
+rem 带版本号的副本（DiskJanitor-0.9.2.exe 等）也要关掉，否则 copy 会因占用失败
+powershell -NoProfile -Command "Get-Process | Where-Object { $_.ProcessName -like 'DiskJanitor*' } | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>&1
 powershell -NoProfile -Command "Get-Process | Where-Object { $_.ProcessName -like '*清理*' -or $_.MainWindowTitle -like '*大帅清理器*' } | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>&1
 timeout /t 1 /nobreak >nul
 
@@ -22,6 +24,9 @@ if errorlevel 1 (
   echo [FAIL] cargo build failed
   exit /b 1
 )
+
+echo [i] Authenticode sign (skipped when no cert) ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\sign-artifacts.ps1" -Path "target\release\disk-janitor.exe"
 
 for /f "tokens=2 delims==" %%v in ('findstr /b "version" Cargo.toml') do (
   set "VER=%%~v"
@@ -48,12 +53,13 @@ powershell -NoProfile -Command ^
 if exist "resources" (
   if not exist "release\resources" mkdir "release\resources"
   copy /Y "resources\*.png" "release\resources\" >nul
+  copy /Y "resources\*.ico" "release\resources\" >nul
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\write-app-update.ps1" -Version "%VER%" -VersionCode %CODE%
 if errorlevel 1 exit /b 1
 powershell -NoProfile -Command ^
-  "$m = Get-Content -Raw 'deploy\app-update.json' | ConvertFrom-Json; if ($m.desktopUrl -notmatch '^https://') { throw 'manifest desktopUrl must use HTTPS' }; if ($m.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'manifest SHA256 must be 64 lowercase hex characters' }; if ((Get-Item 'release\DiskJanitor-%VER%.exe').Length -gt 300MB) { throw 'update payload exceeds 300 MB' }"
+  "$m = Get-Content -Raw -Encoding UTF8 'deploy\app-update.json' | ConvertFrom-Json; if ($m.desktopUrl -notmatch '^https://') { throw 'manifest desktopUrl must use HTTPS' }; if ($m.sha256 -notmatch '^[0-9a-f]{64}$') { throw 'manifest SHA256 must be 64 lowercase hex characters' }; if ((Get-Item 'release\DiskJanitor-%VER%.exe').Length -gt 300MB) { throw 'update payload exceeds 300 MB' }"
 if errorlevel 1 exit /b 1
 
 echo.

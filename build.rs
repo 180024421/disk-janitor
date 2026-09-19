@@ -1,4 +1,4 @@
-// 从 Cargo.toml 生成唯一版本码，避免与 version 手工不同步
+// 从 Cargo.toml 生成唯一版本码，避免与 version 手工不同步；并嵌入 Windows 图标。
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -21,6 +21,25 @@ fn main() {
     fs::write(&out, format!("pub const APP_VERSION_CODE: u32 = {code};\n"))
         .expect("write version_code.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=resources/icon.ico");
+    println!("cargo:rerun-if-changed=resources/icon.png");
+
+    #[cfg(windows)]
+    {
+        let ico = PathBuf::from(&manifest).join("resources").join("icon.ico");
+        if ico.exists() {
+            let mut res = winres::WindowsResource::new();
+            res.set_icon(ico.to_str().unwrap());
+            res.set("ProductName", "大帅清理器");
+            res.set("FileDescription", "大帅清理器 — 磁盘分析与清理");
+            res.set("CompanyName", "lidashuai");
+            res.set("LegalCopyright", "lidashuai");
+            // 主程序与安装器共用同一份图标资源
+            if let Err(e) = res.compile() {
+                eprintln!("winres: {e}");
+            }
+        }
+    }
 }
 
 fn version_code_from_name(v: &str) -> u32 {

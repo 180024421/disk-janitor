@@ -30,6 +30,7 @@ use crate::leftovers::{
     AppLeftoverHint, Confidence, LeftoverHit, UninstallClues, UninstallDiff, UninstallDiffStatus,
     UninstallSnapshot,
 };
+use crate::license::{self, LicenseStatus};
 use crate::model::{
     format_bytes, format_delta, format_mtime, list_drives, sort_entries, FsEntry, ScanIndex,
     SortDir, SortKey,
@@ -52,7 +53,6 @@ use crate::trash_ops::{
     any_sensitive, clean_junk_paths, clean_junk_paths_with, empty_recycle_bin, format_trash_errors,
     move_to_trash, move_to_trash_with, recycle_bin_size, DeleteOptions, TrashResult,
 };
-use crate::treemap;
 use crate::updater::{
     check_update, download_and_apply, open_url, AppConfig, UpdateCheck, APP_VERSION_CODE,
     APP_VERSION_NAME, DEFAULT_API_BASE,
@@ -196,6 +196,16 @@ pub struct JanitorApp {
     appx_filter: String,
     schedule_status: String,
     operation_history: Vec<String>,
+    /// 授权门闩：未激活时仅显示激活页
+    license_unlocked: bool,
+    license_card: String,
+    license_tip: String,
+    license_busy: bool,
+    license_status: Option<LicenseStatus>,
+    /// 上次在线复核授权的时间（失效卡密要及时踢回激活页）
+    license_last_online_check: Option<std::time::Instant>,
+    license_last_local_check: Option<std::time::Instant>,
+    license_recheck_rx: Option<Receiver<Result<LicenseStatus, String>>>,
 }
 
 impl Default for JanitorApp {
@@ -253,7 +263,7 @@ impl Default for JanitorApp {
             list_limit: 100,
             list_total: 0,
             op_log: VecDeque::new(),
-            show_log: true,
+            show_log: false,
             deleting: false,
             config: AppConfig::load(),
             update_status: String::new(),
@@ -306,6 +316,14 @@ impl Default for JanitorApp {
             appx_filter: String::new(),
             schedule_status: String::new(),
             operation_history: operation_log::read_recent(100),
+            license_unlocked: false,
+            license_card: String::new(),
+            license_tip: String::new(),
+            license_busy: false,
+            license_status: None,
+            license_last_online_check: None,
+            license_last_local_check: None,
+            license_recheck_rx: None,
         }
     }
 }
@@ -360,7 +378,247 @@ impl JanitorApp {
         if start_path_scan && has_open_path {
             app.start_scan();
         }
+        // 启动授权校验（同步一次；有缓存票则离线可用）
+        match license::fetch_status() {
+            Ok(s) => {
+                app.license_unlocked = s.valid;
+                app.license_tip = s.message.clone().unwrap_or_default();
+                app.license_status = Some(s);
+            }
+            Err(e) => {
+                if let Some(c) = license::read_cached_status() {
+                    app.license_unlocked = c.valid;
+                    app.license_tip = c.message.clone().unwrap_or_default();
+                    app.license_status = Some(c);
+                } else {
+                    app.license_unlocked = false;
+                    app.license_tip = e;
+                }
+            }
+        }
         app
+    }
+
+    fn ui_license_gate(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::background()))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(if ui.available_height() > 640.0 { 90.0 } else { 36.0 });
+                    let card_w = 520.0_f32.min(ui.available_width() - 32.0);
+                    theme::card_frame().show(ui, |ui| {
+                        ui.set_width(card_w);
+                        ui.vertical_centered(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::Vec2::splat(64.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::CornerRadius::same(18),
+                                ACCENT,
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "清",
+                                egui::FontId::proportional(28.0),
+                                egui::Color32::WHITE,
+                            );
+                            ui.add_space(16.0);
+                            ui.label(
+                                egui::RichText::new("大帅清理器")
+                                    .color(theme::foreground())
+                                    .strong()
+                                    .size(24.0),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("输入卡密完成激活，立即开始清理")
+                                    .color(theme::subtle())
+                                    .size(13.0),
+                            );
+                            ui.add_space(24.0);
+
+                            let inner_w = card_w - 32.0;
+                            ui.allocate_ui_with_layout(
+                                egui::Vec2::new(inner_w, 0.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(inner_w);
+                                    ui.label(
+                                        egui::RichText::new("卡密")
+                                            .color(theme::subtle())
+                                            .size(12.0),
+                                    );
+                                    ui.add_space(6.0);
+                                    egui::Frame::new()
+                                        .fill(theme::row_alt())
+                                        .stroke(egui::Stroke::new(1.0_f32, theme::line()))
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .inner_margin(egui::Margin::symmetric(12, 10))
+                                        .show(ui, |ui| {
+                                            ui.set_width(inner_w - 24.0);
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.license_card)
+                                                    .frame(false)
+                                                    .hint_text("粘贴购买后获得的卡密")
+                                                    .desired_width(f32::INFINITY),
+                                            );
+                                        });
+                                },
+                            );
+                            ui.add_space(14.0);
+                            let activate = ui
+                                .add_enabled_ui(!self.license_busy, |ui| {
+                                    ui.add_sized([inner_w, 44.0], theme::accent_button("立即激活"))
+                                })
+                                .inner;
+                            if activate.clicked() {
+                                self.license_busy = true;
+                                let code = self.license_card.clone();
+                                match license::redeem(&code) {
+                                    Ok(s) => {
+                                        self.license_unlocked = s.valid;
+                                        self.license_tip = s
+                                            .message
+                                            .clone()
+                                            .unwrap_or_else(|| "激活成功".into());
+                                        self.license_status = Some(s);
+                                    }
+                                    Err(e) => {
+                                        self.license_tip = e;
+                                    }
+                                }
+                                self.license_busy = false;
+                            }
+                            ui.add_space(6.0);
+                            ui.vertical_centered(|ui| {
+                                ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !self.license_busy,
+                                        theme::ghost_button("刷新状态"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.license_busy = true;
+                                    match license::fetch_status() {
+                                        Ok(s) => {
+                                            self.license_unlocked = s.valid;
+                                            self.license_tip =
+                                                s.message.clone().unwrap_or_default();
+                                            self.license_status = Some(s);
+                                        }
+                                        Err(e) => self.license_tip = e,
+                                    }
+                                    self.license_busy = false;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.license_busy,
+                                        theme::ghost_button("解绑本机"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.license_busy = true;
+                                    match license::unbind() {
+                                        Ok(s) => {
+                                            self.license_unlocked = s.valid;
+                                            self.license_tip = s
+                                                .message
+                                                .clone()
+                                                .unwrap_or_else(|| "本机授权已解绑".into());
+                                            self.license_status = Some(s);
+                                        }
+                                        Err(e) => self.license_tip = e,
+                                    }
+                                    self.license_busy = false;
+                                }
+                                if ui
+                                    .add(theme::link_button("操作文档"))
+                                    .on_hover_text("打开在线使用说明")
+                                    .clicked()
+                                {
+                                    let _ = open_url(
+                                        "https://jiaoben.lidashuai.top/api/files/guides/disk-janitor.html",
+                                    );
+                                }
+                                });
+                            });
+
+                            if self.license_busy {
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(
+                                        egui::RichText::new("正在与授权服务器通信…")
+                                            .color(theme::subtle())
+                                            .size(12.0),
+                                    );
+                                });
+                            }
+
+                            let tip = self.license_tip.clone();
+                            if !tip.is_empty() {
+                                ui.add_space(14.0);
+                                let color = if self
+                                    .license_status
+                                    .as_ref()
+                                    .map(|s| s.valid)
+                                    .unwrap_or(false)
+                                {
+                                    OK
+                                } else {
+                                    WARN
+                                };
+                                egui::Frame::new()
+                                    .fill(egui::Color32::from_rgba_unmultiplied(
+                                        color.r(),
+                                        color.g(),
+                                        color.b(),
+                                        22,
+                                    ))
+                                    .corner_radius(egui::CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::symmetric(12, 9))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(tip.clone())
+                                                .color(color)
+                                                .size(12.5),
+                                        );
+                                    });
+                            }
+                            if let Some(s) = &self.license_status {
+                                if s.valid {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new("授权有效，正在进入主界面…")
+                                            .color(OK)
+                                            .size(12.5),
+                                    );
+                                }
+                            }
+                            ui.add_space(18.0);
+                            theme::hairline(ui);
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("同卡最多 3 台设备 · 换机请先「解绑本机」")
+                                    .color(theme::subtle())
+                                    .size(11.0),
+                            );
+                            ui.add_space(3.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "v{APP_VERSION_NAME} #{APP_VERSION_CODE}"
+                                ))
+                                .color(theme::subtle())
+                                .size(11.0),
+                            );
+                        });
+                    });
+                });
+            });
     }
 
     /// 扫描/清理等互斥；更新检查独立，不计入 busy
@@ -1930,89 +2188,103 @@ fn draw_tree(ui: &mut egui::Ui, app: &mut JanitorApp, dir: PathBuf, depth: u32) 
 
 impl JanitorApp {
     fn draw_nav(&mut self, ui: &mut egui::Ui) {
-        // 品牌区（Web 侧栏常见 logo + 副标题）
+        // 品牌区：圆角蓝块 + 产品名 + 一句话说明
         ui.horizontal(|ui| {
-            egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(45, 168, 196, 36))
-                .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new("DJ").color(ACCENT).strong().size(14.0));
-                });
-            ui.add_space(8.0);
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(36.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, egui::CornerRadius::same(10), ACCENT);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "清",
+                egui::FontId::proportional(17.0),
+                egui::Color32::WHITE,
+            );
+            ui.add_space(10.0);
             ui.vertical(|ui| {
                 ui.label(
                     egui::RichText::new("大帅清理器")
                         .color(theme::foreground())
                         .strong()
-                        .size(14.5),
+                        .size(15.0),
                 );
-                ui.label(egui::RichText::new("Disk Janitor").color(MUTED).size(11.0));
+                ui.label(
+                    egui::RichText::new("轻松清理 C 盘，释放空间")
+                        .color(theme::subtle())
+                        .size(11.0),
+                );
             });
         });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            theme::version_pill(ui, &format!("v{APP_VERSION_NAME}"));
-            if self.is_admin {
-                ui.label(egui::RichText::new("Admin").color(OK).size(11.0));
-            }
-            if self.pending_update.is_some() {
-                ui.label(egui::RichText::new("有更新").color(DANGER).size(11.0));
-            }
-        });
-        ui.add_space(8.0);
+        ui.add_space(14.0);
         theme::hairline(ui);
 
         let pick = |app: &mut Self, tab: Tab| {
             app.tab = tab;
         };
 
-        if theme::nav_item(ui, self.tab == Tab::Overview, "⌂", "总览").clicked() {
+        ui.add_space(6.0);
+        if theme::nav_item_rich(ui, self.tab == Tab::Overview, "🏠", "总览", "各盘空间与清理建议")
+            .clicked()
+        {
             pick(self, Tab::Overview);
         }
 
         theme::nav_group_label(ui, "分析");
-        for (tab, icon, label) in [
-            (Tab::Browse, "📁", "浏览"),
-            (Tab::TopN, "📊", "最大占用"),
-            (Tab::Types, "🏷", "按类型"),
+        for (tab, icon, label, hint) in [
+            (Tab::Browse, "📁", "浏览", "逐层查看目录占用"),
+            (Tab::TopN, "📊", "最大占用", "TopN 大文件与目录"),
+            (Tab::Types, "🏷", "按类型", "文件类型分布"),
         ] {
-            if theme::nav_item(ui, self.tab == tab, icon, label).clicked() {
+            if theme::nav_item_rich(ui, self.tab == tab, icon, label, hint).clicked() {
                 pick(self, tab);
             }
         }
 
         theme::nav_group_label(ui, "清理");
-        for (tab, icon, label) in [
-            (Tab::Junk, "🧹", "垃圾建议"),
-            (Tab::Duplicates, "⧉", "重复文件"),
-            (Tab::Tools, "🧰", "工具箱"),
+        for (tab, icon, label, hint) in [
+            (Tab::Junk, "🧹", "垃圾建议", "系统垃圾与缓存"),
+            (Tab::Duplicates, "⧉", "重复文件", "找出重复副本"),
+            (Tab::Tools, "🧰", "工具箱", "残留、回收站与诊断"),
         ] {
-            if theme::nav_item(ui, self.tab == tab, icon, label).clicked() {
+            if theme::nav_item_rich(ui, self.tab == tab, icon, label, hint).clicked() {
                 pick(self, tab);
             }
         }
 
         theme::nav_group_label(ui, "系统");
-        for (tab, icon, label) in [
-            (Tab::Software, "📦", "软件卸载"),
-            (Tab::Startup, "⚡", "开机自启"),
-            (Tab::Shortcuts, "🔗", "快捷方式"),
-            (Tab::Registry, "🗄", "注册表"),
+        for (tab, icon, label, hint) in [
+            (Tab::Software, "📦", "软件卸载", "卸载并跟扫残留"),
+            (Tab::Startup, "⚡", "开机自启", "启动项建议"),
+            (Tab::Shortcuts, "🔗", "快捷方式", "失效链接清理"),
+            (Tab::Registry, "🗄", "注册表", "无效卸载项"),
         ] {
-            if theme::nav_item(ui, self.tab == tab, icon, label).clicked() {
+            if theme::nav_item_rich(ui, self.tab == tab, icon, label, hint).clicked() {
                 pick(self, tab);
             }
         }
 
-        ui.add_space(12.0);
+        // 底部固定区
+        ui.add_space(16.0);
         theme::hairline(ui);
-        if theme::nav_item(ui, self.tab == Tab::Settings, "⚙", "设置").clicked() {
-            pick(self, Tab::Settings);
+        ui.add_space(6.0);
+        for (tab, icon, label) in [
+            (Tab::Settings, "⚙", "设置"),
+            (Tab::About, "ℹ", "关于我们"),
+        ] {
+            if theme::nav_item_rich(ui, self.tab == tab, icon, label, "").clicked() {
+                pick(self, tab);
+            }
         }
-        if theme::nav_item(ui, self.tab == Tab::About, "ℹ", "关于").clicked() {
-            pick(self, Tab::About);
-        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            theme::version_pill(ui, &format!("v{APP_VERSION_NAME}"));
+            if self.is_admin {
+                theme::badge(ui, "Admin", OK);
+            }
+            if self.pending_update.is_some() {
+                theme::badge(ui, "有更新", DANGER);
+            }
+        });
         if !self.update_status.is_empty() {
             ui.add_space(6.0);
             ui.label(
@@ -2024,8 +2296,116 @@ impl JanitorApp {
     }
 }
 
+impl JanitorApp {
+    /// 本地票据 + 定期在线复核。卡密过期/冻结后及时踢回激活页，不能继续用。
+    fn revalidate_license(&mut self, ctx: &egui::Context) {
+        if !self.license_unlocked || self.license_busy {
+            return;
+        }
+        // 收后台在线复核结果
+        if let Some(rx) = &self.license_recheck_rx {
+            match rx.try_recv() {
+                Ok(Ok(s)) => {
+                    self.license_recheck_rx = None;
+                    self.license_unlocked = s.valid;
+                    self.license_tip = s.message.clone().unwrap_or_else(|| {
+                        if s.valid {
+                            "授权有效".into()
+                        } else {
+                            "授权已失效，请重新激活或续费".into()
+                        }
+                    });
+                    self.license_status = Some(s);
+                }
+                Ok(Err(e)) => {
+                    self.license_recheck_rx = None;
+                    if e.contains("过期") || e.contains("冻结") || e.contains("失效") {
+                        self.license_unlocked = false;
+                        self.license_tip = e;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.license_recheck_rx = None;
+                }
+            }
+        }
+        if !self.license_unlocked {
+            return;
+        }
+
+        let local_due = self
+            .license_last_local_check
+            .map(|t| t.elapsed().as_secs() >= 2)
+            .unwrap_or(true);
+        if local_due {
+            self.license_last_local_check = Some(std::time::Instant::now());
+            match license::read_cached_status() {
+                Some(s) if s.valid => {}
+                Some(s) => {
+                    self.license_unlocked = false;
+                    self.license_tip = s
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "授权已失效，请重新激活".into());
+                    self.license_status = Some(s);
+                    return;
+                }
+                None => {
+                    force_online_or_lock(self);
+                    return;
+                }
+            }
+        }
+
+        let online_due = self
+            .license_last_online_check
+            .map(|t| t.elapsed().as_secs() >= 60)
+            .unwrap_or(true);
+        if online_due && self.license_recheck_rx.is_none() {
+            self.license_last_online_check = Some(std::time::Instant::now());
+            let (tx, rx) = mpsc::channel();
+            self.license_recheck_rx = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(license::fetch_status());
+            });
+        }
+        // 无交互时也要按时复核
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+    }
+}
+
+fn force_online_or_lock(app: &mut JanitorApp) {
+    app.license_last_online_check = Some(std::time::Instant::now());
+    match license::fetch_status() {
+        Ok(s) => {
+            app.license_status = Some(s.clone());
+            app.license_unlocked = s.valid;
+            app.license_tip = s.message.unwrap_or_else(|| {
+                if s.valid {
+                    "授权有效".into()
+                } else {
+                    "授权已失效，请重新激活".into()
+                }
+            });
+        }
+        Err(e) => {
+            app.license_unlocked = false;
+            app.license_tip = e;
+            app.license_status = None;
+        }
+    }
+}
+
 impl eframe::App for JanitorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.license_unlocked {
+            self.revalidate_license(ctx);
+        }
+        if !self.license_unlocked {
+            self.ui_license_gate(ctx);
+            return;
+        }
         if self.about_assets.is_none() {
             self.about_assets = Some(AboutAssets::load(ctx));
         }
@@ -2120,23 +2500,28 @@ impl eframe::App for JanitorApp {
         }
 
         egui::SidePanel::left("nav")
-            .exact_width(200.0)
+            .exact_width(240.0)
             .resizable(false)
             .frame(theme::sidebar_frame())
             .show(ctx, |ui| {
-                self.draw_nav(ui);
+                // 窗口较矮时导航可滚动，避免底部「设置/关于」被挤出可视区
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.draw_nav(ui);
+                    });
             });
 
         egui::TopBottomPanel::top("top")
             .frame(theme::top_bar_frame())
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("路径").color(MUTED).size(12.0));
                     let path_edit = ui
                         .add(
                             egui::TextEdit::singleline(&mut self.root_input)
                                 .id_salt("scan_root_input")
-                                .desired_width(ui.available_width().clamp(260.0, 480.0))
+                                .desired_width(ui.available_width().clamp(200.0, 360.0))
                                 .hint_text(r"C:\ 或文件夹路径"),
                         )
                         .on_hover_text("输入任意文件夹或盘符根；Ctrl+L 聚焦，Enter 开始扫描");
@@ -2230,12 +2615,12 @@ impl eframe::App for JanitorApp {
         egui::TopBottomPanel::bottom("bottom")
             .frame(theme::status_bar_frame())
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("状态").color(MUTED).size(12.0));
                     ui.label(&self.status);
                 });
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if matches!(self.tab, Tab::Browse | Tab::TopN | Tab::Types) {
                         let n = self.selected.len();
                         let sz = self.selected_total_size();
@@ -2387,7 +2772,8 @@ impl eframe::App for JanitorApp {
                         .default_open(self.show_log)
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
-                                .max_height(120.0)
+                                // 高度随窗口自适应，矮窗口不挤压主内容区
+                                .max_height((ctx.screen_rect().height() * 0.28).clamp(80.0, 220.0))
                                 .show(ui, |ui| {
                                     for line in self.op_log.iter().take(40) {
                                         ui.monospace(line);
@@ -2430,161 +2816,119 @@ impl JanitorApp {
         egui::CentralPanel::default()
             .frame(theme::content_frame())
             .show(ctx, |ui| {
-                theme::page_header(ui, "工作台", "查看各盘空间，快速扫描与安全清理。");
-
-                // KPI 指标行
-                let total_used: u64 = self.drive_infos.iter().map(|d| d.used()).sum();
-                let total_free: u64 = self.drive_infos.iter().map(|d| d.free).sum();
+                // 整页纳入滚动区：窗口变矮或内容变长时可以滚动查看，不必把窗口拖大
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                // KPI 指标
                 let dup_waste: u64 = self.dup_groups.iter().map(|g| g.waste()).sum();
                 let junk_safe = safe_selected_size(&self.junk_hits);
+                let junk_total: u64 = self.junk_hits.iter().map(|h| h.size).sum();
                 let reclaim = if self.junk_hits.is_empty() && self.dup_groups.is_empty() {
                     0
                 } else {
                     reclaimable_estimate(&self.junk_hits, dup_waste)
                 };
+                let hero_value = if junk_total > 0 { junk_total } else { reclaim };
 
+                // 顶部：左标题、右主按钮，不换行挤进标题区
                 ui.horizontal(|ui| {
-                    theme::metric_card(
-                        ui,
-                        "已用空间",
-                        &format_bytes(total_used),
-                        &format!("{} 个磁盘", self.drive_infos.len()),
-                        ACCENT,
-                    );
-                    ui.add_space(8.0);
-                    theme::metric_card(ui, "可用空间", &format_bytes(total_free), "各盘合计", OK);
-                    ui.add_space(8.0);
-                    theme::metric_card(
-                        ui,
-                        "可回收估算",
-                        &if reclaim > 0 {
-                            format_bytes(reclaim)
-                        } else {
-                            "—".into()
-                        },
-                        if reclaim > 0 {
-                            "垃圾 + 重复"
-                        } else {
-                            "先扫描垃圾/重复"
-                        },
-                        WARN,
-                    );
-                    ui.add_space(8.0);
-                    theme::metric_card(
-                        ui,
-                        "安全可清",
-                        &if junk_safe > 0 {
-                            format_bytes(junk_safe)
-                        } else {
-                            "—".into()
-                        },
-                        "已勾选安全项",
-                        OK,
-                    );
-                });
-
-                ui.add_space(14.0);
-
-                // 快捷操作条
-                theme::card_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("快捷操作")
+                                egui::RichText::new("共发现")
                                     .color(theme::foreground())
-                                    .strong()
-                                    .size(14.0),
+                                    .size(21.0)
+                                    .strong(),
                             );
-                            if self.config.last_scan_summary.trim().is_empty() {
-                                ui.label(
-                                    egui::RichText::new("尚无扫描记录，选一个盘开始。")
-                                        .color(MUTED)
-                                        .size(12.0),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "上次：{}",
-                                        self.config.last_scan_summary
-                                    ))
-                                    .color(MUTED)
-                                    .size(12.0),
-                                );
-                            }
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(theme::ghost_button("打开回收站")).clicked() {
-                                if let Err(e) = paths_ui::open_recycle_bin() {
-                                    self.status = e;
-                                }
-                            }
-                            if ui
-                                .add_enabled(!self.busy(), theme::ghost_button("一键安全清理"))
-                                .clicked()
-                            {
-                                if self.junk_hits.is_empty() {
-                                    self.status = "请先到「垃圾建议」扫描后再一键安全清理".into();
-                                    self.tab = Tab::Junk;
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(if hero_value > 0 {
+                                    format_bytes(hero_value)
                                 } else {
-                                    apply_safe_selection(&mut self.junk_hits);
-                                    if junk_selected_paths(&self.junk_hits).is_empty() {
-                                        self.status = "当前没有可安全清理的项".into();
-                                    } else {
-                                        self.confirm_safe_clean = true;
-                                    }
-                                }
-                            }
-                            let can_resume =
-                                !self.config.last_scan_root.trim().is_empty() && !self.busy();
-                            if ui
-                                .add_enabled(can_resume, theme::accent_button("续扫上次"))
-                                .clicked()
-                            {
-                                self.resume_last_scan();
-                            }
+                                    "—".to_string()
+                                })
+                                .color(ACCENT)
+                                .size(30.0)
+                                .strong(),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("可清理文件")
+                                    .color(theme::foreground())
+                                    .size(21.0)
+                                    .strong(),
+                            );
                         });
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(if junk_total > 0 {
+                                "定期清理可释放磁盘空间，让电脑运行更流畅。"
+                            } else {
+                                "先扫描垃圾，即可看到可清理的空间。"
+                            })
+                            .color(theme::subtle())
+                            .size(13.0),
+                        );
                     });
-                });
-
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("磁盘")
-                            .color(theme::foreground())
-                            .strong()
-                            .size(15.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("已选 {} 个", self.selected_drives.len()))
-                            .color(MUTED)
-                            .size(12.0),
-                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(theme::ghost_button("刷新")).clicked() {
-                            self.refresh_drives();
-                        }
                         if ui
-                            .add_enabled(
-                                !self.busy() && !self.selected_drives.is_empty(),
-                                theme::ghost_button("极速扫描已选"),
-                            )
+                            .add_enabled(!self.busy(), theme::accent_button("一键清理"))
+                            .on_hover_text("勾选安全项后清理")
                             .clicked()
                         {
-                            let roots: Vec<PathBuf> = self
-                                .drive_infos
-                                .iter()
-                                .filter(|drive| {
-                                    self.selected_drives
-                                        .contains(&drive.root.display().to_string())
-                                })
-                                .map(|drive| drive.root.clone())
-                                .collect();
-                            self.start_queued_drive_scans(roots, true);
+                            if self.junk_hits.is_empty() {
+                                self.status = "请先到「垃圾建议」扫描后再一键安全清理".into();
+                                self.tab = Tab::Junk;
+                            } else {
+                                apply_safe_selection(&mut self.junk_hits);
+                                if junk_selected_paths(&self.junk_hits).is_empty() {
+                                    self.status = "当前没有可安全清理的项".into();
+                                } else {
+                                    self.confirm_safe_clean = true;
+                                }
+                            }
                         }
+                        ui.add_space(8.0);
+                        if ui
+                            .add(theme::ghost_button("刷新扫描"))
+                            .on_hover_text("重新统计各盘空间")
+                            .clicked()
+                        {
+                            self.refresh_drives();
+                        }
+                    });
+                });
+                ui.add_space(16.0);
+
+                let junk_rows: Vec<(String, String, u64, bool)> = self
+                    .junk_hits
+                    .iter()
+                    .take(6)
+                    .map(|h| (h.title.clone(), h.detail.clone(), h.size, h.selected))
+                    .collect();
+                let junk_more = self.junk_hits.len().saturating_sub(junk_rows.len());
+
+                ui.horizontal(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("磁盘")
+                                .color(theme::foreground())
+                                .strong()
+                                .size(15.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!("已选 {} 个", self.selected_drives.len()))
+                                .color(MUTED)
+                                .size(12.0),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 !self.busy() && !self.selected_drives.is_empty(),
-                                theme::accent_button("普通扫描已选"),
+                                theme::accent_button("扫描已选"),
                             )
                             .clicked()
                         {
@@ -2599,128 +2943,245 @@ impl JanitorApp {
                                 .collect();
                             self.start_queued_drive_scans(roots, false);
                         }
+                        ui.add_space(6.0);
+                        if ui
+                            .add_enabled(
+                                !self.busy() && !self.selected_drives.is_empty(),
+                                theme::ghost_button("极速已选"),
+                            )
+                            .clicked()
+                        {
+                            let roots: Vec<PathBuf> = self
+                                .drive_infos
+                                .iter()
+                                .filter(|drive| {
+                                    self.selected_drives
+                                        .contains(&drive.root.display().to_string())
+                                })
+                                .map(|drive| drive.root.clone())
+                                .collect();
+                            self.start_queued_drive_scans(roots, true);
+                        }
+                        ui.add_space(6.0);
+                        if ui.add(theme::ghost_button("刷新")).clicked() {
+                            self.refresh_drives();
+                        }
                     });
                 });
                 ui.add_space(8.0);
 
                 if self.drive_infos.is_empty() {
                     theme::empty_state(ui, "未检测到可用磁盘", "点击刷新重试");
-                    return;
-                }
-
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                } else {
                     let drives = self.drive_infos.clone();
-                    // 真正的双列：每两个卡片一行
-                    let mut i = 0;
-                    while i < drives.len() {
-                        ui.horizontal(|ui| {
-                            for j in 0..2 {
-                                if i + j >= drives.len() {
-                                    break;
-                                }
-                                let d = &drives[i + j];
-                                let card_w =
-                                    ((ui.available_width() - 12.0) / (2 - j) as f32).max(260.0);
-                                theme::card_frame().show(ui, |ui| {
-                                    ui.set_min_width(card_w - 8.0);
-                                    ui.set_max_width(card_w - 8.0);
+                    for d in &drives {
+                        theme::card_frame().show(ui, |ui| {
+                            let ratio = d.used_ratio();
+                            let pct = (ratio * 100.0).round() as i32;
+                            let pct_color = if ratio >= 0.9 {
+                                DANGER
+                            } else if ratio >= 0.75 {
+                                WARN
+                            } else {
+                                ACCENT
+                            };
+                            ui.horizontal(|ui| {
+                                theme::donut(
+                                    ui,
+                                    ratio,
+                                    88.0,
+                                    &format!("{pct}%"),
+                                    "已使用",
+                                    pct_color,
+                                );
+                                ui.add_space(16.0);
+                                ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(&d.label)
-                                                    .color(theme::foreground())
-                                                    .strong()
-                                                    .size(16.0),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{} · {}",
-                                                    d.kind,
-                                                    d.root.display()
-                                                ))
-                                                .color(MUTED)
-                                                .size(11.5),
-                                            );
-                                        });
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::TOP),
+                                        ui.label(
+                                            egui::RichText::new(&d.label)
+                                                .color(theme::foreground())
+                                                .strong()
+                                                .size(16.0),
+                                        );
+                                        ui.add_space(8.0);
+                                        theme::badge(ui, &d.kind, ACCENT);
+                                    });
+                                    ui.add_space(10.0);
+                                    let bar_w = ui.available_width();
+                                    theme::drive_usage_bar(ui, ratio, bar_w);
+                                    ui.add_space(8.0);
+                                    let col_w = (bar_w / 3.0).max(72.0);
+                                    ui.horizontal(|ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(col_w, 18.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
-                                                let pct = (d.used_ratio() * 100.0).round() as i32;
-                                                let pct_color = if d.used_ratio() >= 0.9 {
-                                                    DANGER
-                                                } else if d.used_ratio() >= 0.75 {
-                                                    WARN
-                                                } else {
-                                                    ACCENT
-                                                };
+                                                let (dot, _) = ui.allocate_exact_size(
+                                                    egui::Vec2::splat(8.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    dot,
+                                                    egui::CornerRadius::same(2),
+                                                    pct_color,
+                                                );
+                                                ui.add_space(6.0);
                                                 ui.label(
-                                                    egui::RichText::new(format!("{pct}%"))
-                                                        .color(pct_color)
-                                                        .strong()
-                                                        .size(18.0),
+                                                    egui::RichText::new(format!(
+                                                        "已使用 {}",
+                                                        format_bytes(d.used())
+                                                    ))
+                                                    .color(theme::subtle())
+                                                    .size(12.0),
+                                                );
+                                            },
+                                        );
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(col_w, 18.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                let (dot, _) = ui.allocate_exact_size(
+                                                    egui::Vec2::splat(8.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().rect_filled(
+                                                    dot,
+                                                    egui::CornerRadius::same(2),
+                                                    theme::track(),
+                                                );
+                                                ui.add_space(6.0);
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "可用 {}",
+                                                        format_bytes(d.free)
+                                                    ))
+                                                    .color(theme::subtle())
+                                                    .size(12.0),
+                                                );
+                                            },
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "总容量 {}",
+                                                        format_bytes(d.total)
+                                                    ))
+                                                    .color(theme::subtle())
+                                                    .size(12.0),
                                                 );
                                             },
                                         );
                                     });
-                                    ui.add_space(10.0);
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format_bytes(d.used()))
-                                                .color(theme::foreground())
-                                                .size(12.5),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "/ {} · 可用 {}",
-                                                format_bytes(d.total),
-                                                format_bytes(d.free)
-                                            ))
-                                            .color(MUTED)
-                                            .size(12.0),
-                                        );
-                                    });
-                                    ui.add_space(6.0);
-                                    theme::drive_usage_bar(
-                                        ui,
-                                        d.used_ratio(),
-                                        ui.available_width(),
-                                    );
-                                    ui.add_space(12.0);
-                                    ui.horizontal(|ui| {
-                                        let drive_key = d.root.display().to_string();
-                                        let mut selected =
-                                            self.selected_drives.contains(&drive_key);
-                                        if ui.checkbox(&mut selected, "加入多盘队列").changed()
-                                        {
-                                            if selected {
-                                                self.selected_drives.insert(drive_key);
-                                            } else {
-                                                self.selected_drives.remove(&drive_key);
-                                            }
-                                        }
-                                        if ui.add(theme::accent_button("普通扫描")).clicked() {
+                                });
+                            });
+                            ui.add_space(10.0);
+                            theme::hairline(ui);
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let drive_key = d.root.display().to_string();
+                                let mut selected = self.selected_drives.contains(&drive_key);
+                                if ui.checkbox(&mut selected, "加入队列").changed() {
+                                    if selected {
+                                        self.selected_drives.insert(drive_key);
+                                    } else {
+                                        self.selected_drives.remove(&drive_key);
+                                    }
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.add(theme::accent_button("扫描")).clicked() {
                                             self.root_input = d.root.display().to_string();
                                             self.start_scan_with_opts(false);
                                         }
-                                        if ui.add(theme::ghost_button("极速扫描")).clicked() {
+                                        ui.add_space(6.0);
+                                        if ui.add(theme::ghost_button("极速")).clicked() {
                                             self.root_input = d.root.display().to_string();
                                             self.start_scan_with_opts(true);
                                         }
-                                        if ui.add(theme::ghost_button("设为路径")).clicked() {
+                                        ui.add_space(6.0);
+                                        if ui.add(theme::ghost_button("选为路径")).clicked() {
                                             self.root_input = d.root.display().to_string();
-                                            self.status = format!("已选择 {}", d.root.display());
+                                            self.status =
+                                                format!("已选择 {}", d.root.display());
                                         }
-                                    });
-                                });
-                                if j == 0 && i + 1 < drives.len() {
-                                    ui.add_space(12.0);
-                                }
-                            }
+                                    },
+                                );
+                            });
                         });
-                        ui.add_space(12.0);
-                        i += 2;
+                        ui.add_space(10.0);
                     }
+                }
+                ui.add_space(14.0);
+
+                if !junk_rows.is_empty() {
+                    theme::card_frame().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("可清理项目")
+                                    .color(theme::foreground())
+                                    .strong()
+                                    .size(15.0),
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "已选择 {}",
+                                        format_bytes(junk_safe)
+                                    ))
+                                    .color(ACCENT)
+                                    .strong()
+                                    .size(12.5),
+                                );
+                            });
+                        });
+                        ui.add_space(6.0);
+                        for (title, detail, size, selected) in &junk_rows {
+                            let value = format_bytes(*size);
+                            if theme::item_row(
+                                ui,
+                                "🧹",
+                                title,
+                                detail,
+                                &value,
+                                if *selected { ACCENT } else { MUTED },
+                            )
+                            .clicked()
+                            {
+                                self.tab = Tab::Junk;
+                            }
+                        }
+                        if junk_more > 0 {
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "还有 {junk_more} 项，去「垃圾建议」查看全部"
+                                ))
+                                .color(theme::subtle())
+                                .size(11.5),
+                            );
+                        }
+                    });
+                    ui.add_space(12.0);
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("🛡").size(13.0));
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("安全清理，默认进回收站，不会删除重要文件")
+                            .color(theme::subtle())
+                            .size(12.0),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(theme::link_button("查看扫描详情")).clicked() {
+                            self.tab = Tab::Junk;
+                        }
+                    });
                 });
+                    });
             });
     }
 
@@ -3372,7 +3833,7 @@ impl JanitorApp {
                         }
                     }
                     ui.group(|ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.strong(&app.display_name);
                             ui.label(app.hive);
                             if !app.version.is_empty() {
@@ -3381,7 +3842,8 @@ impl JanitorApp {
                             if app.estimated_size > 0 {
                                 ui.label(format_bytes(app.estimated_size));
                             }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            {
                                 if ui.button("卸载").clicked() {
                                     to_uninstall = Some(i);
                                 }
@@ -3403,7 +3865,7 @@ impl JanitorApp {
                                 {
                                     to_svc = Some(i);
                                 }
-                            });
+                            }
                         });
                         if !app.publisher.is_empty() {
                             ui.weak(&app.publisher);
@@ -3610,7 +4072,7 @@ impl JanitorApp {
                         }
                     }
                     ui.group(|ui| {
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if item.enabled {
                                 ui.colored_label(egui::Color32::from_rgb(40, 140, 70), "启用");
                             } else {
@@ -3631,7 +4093,8 @@ impl JanitorApp {
                                 StartupImpact::Unknown => MUTED,
                             };
                             ui.colored_label(impact_color, item.impact.label());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            {
                                 if !item.enabled
                                     && item.advice.can_disable()
                                     && ui.small_button("删除禁用记录").clicked()
@@ -3655,7 +4118,7 @@ impl JanitorApp {
                                 } else if ui.small_button("启用").clicked() {
                                     action = Some((i, "enable"));
                                 }
-                            });
+                            }
                         });
                         ui.label(
                             egui::RichText::new(format!("用途：{}", item.purpose))

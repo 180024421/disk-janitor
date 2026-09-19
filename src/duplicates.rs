@@ -162,14 +162,48 @@ fn physical_file_id(path: &Path) -> PhysicalFileId {
 }
 
 fn physical_file_id_result(path: &Path) -> std::io::Result<PhysicalFileId> {
+    // Windows 走句柄 API，不需要 metadata；unix 分支用它取 dev/ino
+    #[cfg(unix)]
     let metadata = fs::metadata(path)?;
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        if let (Some(volume), Some(index)) =
-            (metadata.volume_serial_number(), metadata.file_index())
-        {
-            return Ok(PhysicalFileId::Windows { volume, index });
+        // std 的 MetadataExt::volume_serial_number()/file_index() 仍属于
+        // `windows_by_handle` 不稳定特性（rust-lang/rust#63010），stable 上无法编译。
+        // 这里走 kernel32 的 GetFileInformationByHandle，字段语义与之一致；
+        // 打开失败（被占用 / 无权限 / 目录）时落到下面的 Path 兜底。
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        struct ByHandleFileInformation {
+            file_attributes: u32,
+            creation_time: [u32; 2],
+            last_access_time: [u32; 2],
+            last_write_time: [u32; 2],
+            volume_serial_number: u32,
+            file_size_high: u32,
+            file_size_low: u32,
+            number_of_links: u32,
+            file_index_high: u32,
+            file_index_low: u32,
+        }
+
+        extern "system" {
+            fn GetFileInformationByHandle(
+                handle: *mut core::ffi::c_void,
+                info: *mut ByHandleFileInformation,
+            ) -> i32;
+        }
+
+        if let Ok(file) = File::open(path) {
+            let mut info = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+            let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+            if ok != 0 {
+                let index = ((info.file_index_high as u64) << 32) | info.file_index_low as u64;
+                return Ok(PhysicalFileId::Windows {
+                    volume: info.volume_serial_number,
+                    index,
+                });
+            }
         }
     }
 

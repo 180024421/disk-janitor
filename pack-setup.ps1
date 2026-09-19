@@ -52,9 +52,11 @@ Copy-Item -Force "release\disk-janitor.exe" (Join-Path $packDir "DashuaiCleaner.
 Copy-Item -Force "release\disk-janitor.exe" (Join-Path $packDir "$product.exe")
 if (Test-Path "resources") {
   Copy-Item -Force "resources\*.png" (Join-Path $packDir "resources\") -ErrorAction SilentlyContinue
+  Copy-Item -Force "resources\*.ico" (Join-Path $packDir "resources\") -ErrorAction SilentlyContinue
 }
 if (Test-Path "release\resources") {
   Copy-Item -Force "release\resources\*.png" (Join-Path $packDir "resources\") -ErrorAction SilentlyContinue
+  Copy-Item -Force "release\resources\*.ico" (Join-Path $packDir "resources\") -ErrorAction SilentlyContinue
 }
 
 $payload = Join-Path $root "installer\payload.zip"
@@ -65,7 +67,8 @@ Write-Host "[3/4] compile setup..."
 & cargo build --release --bin dashuai-cleaner-setup --features setup
 if ($LASTEXITCODE -ne 0) { throw "setup build failed" }
 
-Write-Host "[4/4] copy outputs..."
+Write-Host "[4/4] sign + copy outputs..."
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\sign-artifacts.ps1") -Path (Join-Path $root "target\release\dashuai-cleaner-setup.exe")
 $setupSrc = "target\release\dashuai-cleaner-setup.exe"
 $setupCn = Join-Path $root "release\$product-Setup-$ver.exe"
 $setupEn = Join-Path $root "release\DashuaiCleaner-Setup-$ver.exe"
@@ -75,7 +78,7 @@ Copy-Item -Force $setupSrc $setupEn
 if ((Get-Item $setupCn).Length -gt 300MB) { throw "setup payload exceeds 300 MB" }
 $sha = (Get-FileHash -Algorithm SHA256 -Path $setupCn).Hash.ToLowerInvariant()
 if ($sha -notmatch '^[0-9a-f]{64}$') { throw "invalid setup SHA256" }
-$updateManifest = Get-Content -Raw (Join-Path $root "deploy\app-update.json") | ConvertFrom-Json
+$updateManifest = Get-Content -Raw -Encoding UTF8 (Join-Path $root "deploy\app-update.json") | ConvertFrom-Json
 $updateUri = $null
 if (-not [Uri]::TryCreate([string]$updateManifest.desktopUrl, [UriKind]::Absolute, [ref]$updateUri) -or
     $updateUri.Scheme -ne [Uri]::UriSchemeHttps -or

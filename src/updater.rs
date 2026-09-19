@@ -10,31 +10,31 @@ pub const APP_VERSION_NAME: &str = env!("CARGO_PKG_VERSION");
 include!(concat!(env!("OUT_DIR"), "/version_code.rs"));
 pub const APP_KEY: &str = "disk-janitor";
 pub const MAX_UPDATE_BYTES: u64 = 300 * 1024 * 1024;
-/// 与 DeskReader 一致：花生壳 HTTPS → Nginx → jiaoben（勿带 :8687）
-pub const DEFAULT_API_BASE: &str = "https://1ph1hf8043323.vicp.fun";
+/// 正式域名：HTTPS → Nginx → jiaoben（勿带 :8687）。历史花生壳域名 / 直连 IP 由
+/// rewrite_public_host 统一重写到这里。
+pub const DEFAULT_API_BASE: &str = "https://jiaoben.lidashuai.top";
 
-/// 历史占位 / 直连 IP:8687 → 统一到花生壳域名
+/// 历史占位（`YOUR_SERVER_IP`）与直连 IP 写法 → 统一到正式域名。
+///
+/// 旧第三方动态域名已彻底弃用：客户端既不识别也不重写它。若某台机器的本地设置里
+/// 还残留旧地址，把 `update_api_base` 清空即可回落到默认域名（`DEFAULT_API_BASE`）。
 pub fn rewrite_public_host(url: &str) -> String {
     let mut u = url.trim().to_string();
     if u.is_empty() {
         return u;
     }
-    u = u.replace("YOUR_SERVER_IP", "1ph1hf8043323.vicp.fun");
+    u = u.replace("YOUR_SERVER_IP", "jiaoben.lidashuai.top");
     for old in [
         "http://111.229.202.251:8687",
         "https://111.229.202.251:8687",
         "http://111.229.202.251",
         "https://111.229.202.251",
-        "http://1ph1hf8043323.vicp.fun:8687",
-        "https://1ph1hf8043323.vicp.fun:8687",
     ] {
         u = u.replace(old, DEFAULT_API_BASE);
     }
-    if u.starts_with("http://1ph1hf8043323.vicp.fun") {
-        u = u.replacen("http://", "https://", 1);
-    }
     u
 }
+
 
 #[derive(Debug, Clone)]
 pub struct RemoteManifest {
@@ -190,7 +190,7 @@ impl AppConfig {
 
     pub fn load() -> Self {
         let p = Self::path();
-        let mut cfg = crate::persistence::load_json(&p).unwrap_or_default();
+        let mut cfg: Self = crate::persistence::load_json(&p).unwrap_or_default();
         cfg.normalize();
         cfg
     }
@@ -387,6 +387,9 @@ fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
         .get("sha256")
         .or_else(|| v.get("sha256sum"))
         .or_else(|| v.get("hash"))
+        // jiaoben /api/app-update 实际返回这两个字段名，缺了它整条更新链会被拒绝
+        .or_else(|| v.get("desktopSha256"))
+        .or_else(|| v.get("downloadSha256"))
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .trim()
@@ -752,32 +755,72 @@ mod tests {
         assert_eq!(m.url, "https://y/b.exe");
     }
 
+    /// 真机探测更新检查（联网，默认不跑）：
+    /// `cargo test --release --bin disk-janitor live_update_check_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_update_check_probe() {
+        let base = std::env::var("DISKJANITOR_UPDATE_BASE")
+            .unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
+        match check_update(&base) {
+            UpdateCheck::UpToDate => println!("UPDATE_OK up-to-date (base={base})"),
+            UpdateCheck::Available(m) => println!(
+                "UPDATE_OK available {} code={} sha={} url={}",
+                m.version_name,
+                m.version_code,
+                &m.sha256[..12.min(m.sha256.len())],
+                m.url
+            ),
+            UpdateCheck::Failed(e) => println!("UPDATE_ERR {e}"),
+            UpdateCheck::Disabled => println!("UPDATE_SKIP 检查已关闭"),
+        }
+    }
+
+    #[test]
+    fn parses_jiaoben_desktop_sha256_field() {
+        // jiaoben /api/app-update 用的是 desktopSha256 / downloadSha256，曾经取不到导致更新链整体失败
+        let sha = "a".repeat(64);
+        let j = format!(
+            r#"{{"code":200,"data":{{"versionCode":904,"versionName":"0.9.4","desktopUrl":"https://h/x.exe","desktopSha256":"{sha}","downloadSha256":"{sha}","changelog":"c"}}}}"#
+        );
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let m = parse_update_payload(&v["data"]).unwrap();
+        assert_eq!(m.version_code, 904);
+        assert_eq!(m.version_name, "0.9.4");
+        assert_eq!(m.sha256, sha);
+    }
+
     #[test]
     fn candidate_urls_match_reader_shape() {
-        let u = candidate_urls("https://1ph1hf8043323.vicp.fun");
+        let u = candidate_urls("https://jiaoben.lidashuai.top");
         assert_eq!(
             u[0],
-            "https://1ph1hf8043323.vicp.fun/api/app-update/disk-janitor"
+            "https://jiaoben.lidashuai.top/api/app-update/disk-janitor"
         );
         assert_eq!(
             u[1],
-            "https://1ph1hf8043323.vicp.fun/disk-janitor/app-update.json"
+            "https://jiaoben.lidashuai.top/disk-janitor/app-update.json"
         );
         assert_eq!(
             u[2],
-            "https://1ph1hf8043323.vicp.fun/api/disk-janitor/app-update"
+            "https://jiaoben.lidashuai.top/api/disk-janitor/app-update"
         );
     }
 
     #[test]
-    fn rewrite_old_ip_to_vicp_fun() {
+    fn rewrite_old_hosts_to_official_domain() {
         assert_eq!(
             rewrite_public_host("http://111.229.202.251:8687"),
             DEFAULT_API_BASE
         );
         assert_eq!(
-            rewrite_public_host("http://1ph1hf8043323.vicp.fun:8687/dl/a.exe"),
-            "https://1ph1hf8043323.vicp.fun/dl/a.exe"
+            rewrite_public_host("https://111.229.202.251/dl/a.exe"),
+            "https://jiaoben.lidashuai.top/dl/a.exe"
+        );
+        // 正式域名自身保持不变
+        assert_eq!(
+            rewrite_public_host("https://jiaoben.lidashuai.top/dl/a.exe"),
+            "https://jiaoben.lidashuai.top/dl/a.exe"
         );
     }
 

@@ -3,6 +3,7 @@ mod admin;
 mod app;
 mod app_state;
 mod checkpoint;
+mod crypto_transport;
 mod deep_uninstall;
 mod drives;
 mod duplicates;
@@ -12,6 +13,7 @@ mod file_types;
 mod jobs;
 mod junk;
 mod leftovers;
+mod license;
 mod model;
 mod operation_log;
 mod orphans;
@@ -46,10 +48,13 @@ fn main() -> eframe::Result<()> {
     let open_path = parse_path_arg(&args);
     let start_path_scan = args.iter().any(|a| a == "--scan");
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/icon.png"))
+        .unwrap_or_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([860.0, 560.0])
+            .with_min_inner_size([800.0, 520.0])
+            .with_icon(icon)
             .with_title(format!(
                 "大帅清理器 v{} #{}",
                 env!("CARGO_PKG_VERSION"),
@@ -92,6 +97,10 @@ fn parse_path_arg(args: &[String]) -> Option<PathBuf> {
 
 fn run_quiet_clean() {
     println!("disk-janitor --quiet-clean v{}", env!("CARGO_PKG_VERSION"));
+    if !license::is_unlocked() {
+        eprintln!("未授权：安静清理已跳过（请先在 GUI 中激活卡密）");
+        return;
+    }
     let cancel = AtomicBool::new(false);
     let cfg = updater::AppConfig::load();
     let hits = scan_junk(&cancel);

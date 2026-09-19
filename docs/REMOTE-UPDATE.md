@@ -4,8 +4,9 @@
 
 ## 默认
 
-- 根地址：`https://1ph1hf8043323.vicp.fun`（花生壳 HTTPS → Nginx → jiaoben，与 DeskReader 一致）
+- 根地址：`https://jiaoben.lidashuai.top`（HTTPS → Nginx → jiaoben；历史直连 IP 写法由 `updater::rewrite_public_host` 自动重写到此域名）
 - appKey：`disk-janitor`
+- Nginx：站点 `jiaoben.lidashuai.top` 需包含 `location ^~ /api/app-update/` 与 `location ^~ /api/` 两条反代（否则更新探测 404）
 
 ## 探测 URL
 
@@ -21,7 +22,7 @@
 {
   "versionCode": 4,
   "versionName": "0.3.0",
-  "desktopUrl": "https://1ph1hf8043323.vicp.fun/api/files/app-update/disk-janitor/DiskJanitor-0.3.0.exe",
+  "desktopUrl": "https://jiaoben.lidashuai.top/api/files/app-update/disk-janitor/DiskJanitor-0.3.0.exe",
   "sha256": "可选：小写 hex，下载后校验，失败则拒绝安装",
   "changelog": "0.3.0 总览/重复/工具箱等",
   "displayName": "大帅清理器",
