@@ -1,0 +1,34 @@
+//! disk-janitor 模块库：供主 GUI 二进制与打包工具（dj-manifest-sign）共用。
+
+pub mod about;
+pub mod admin;
+pub mod app;
+pub mod app_state;
+pub mod checkpoint;
+pub mod crypto_transport;
+pub mod deep_uninstall;
+pub mod drives;
+pub mod duplicates;
+pub mod export;
+pub mod fast_scan;
+pub mod file_types;
+pub mod jobs;
+pub mod junk;
+pub mod leftovers;
+pub mod license;
+pub mod model;
+pub mod operation_log;
+pub mod orphans;
+pub mod paths_ui;
+pub mod persistence;
+pub mod safety;
+pub mod scan;
+pub mod schedule;
+pub mod shortcuts;
+pub mod software;
+pub mod startup;
+pub mod theme;
+pub mod trash_ops;
+pub mod treemap;
+pub mod updater;
+pub mod whitelist;

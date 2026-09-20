@@ -32,6 +32,16 @@ pub struct RelatedTask {
     pub state: String,
 }
 
+/// PowerShell 单引号字面量：双引号串会执行 $( ) / ` 插值，禁止用于嵌入外部字符串。
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn ps_string_array(items: &[String]) -> String {
+    let parts: Vec<String> = items.iter().map(|s| ps_quote(s)).collect();
+    format!("@({})", parts.join(", "))
+}
+
 /// 查找主模块路径落在给定安装目录下的进程。
 pub fn list_locking_processes(paths: &[PathBuf]) -> Vec<LockingProcess> {
     if paths.is_empty() {
@@ -53,10 +63,10 @@ pub fn list_locking_processes(paths: &[PathBuf]) -> Vec<LockingProcess> {
     if dirs.is_empty() {
         return Vec::new();
     }
-    let dirs_json = serde_json::to_string(&dirs).unwrap_or_else(|_| "[]".into());
+    let dirs_ps = ps_string_array(&dirs);
     let script = format!(
         r#"
-$dirs = {dirs_json} | ConvertFrom-Json
+$dirs = {dirs_ps}
 $out = @()
 Get-Process -ErrorAction SilentlyContinue | ForEach-Object {{
   try {{
@@ -213,10 +223,10 @@ pub fn list_related_services(tokens: &[String]) -> Vec<RelatedService> {
     if tokens.is_empty() {
         return Vec::new();
     }
-    let tokens_json = serde_json::to_string(tokens).unwrap_or_else(|_| "[]".into());
+    let tokens_ps = ps_string_array(tokens);
     let script = format!(
         r#"
-$tokens = {tokens_json} | ConvertFrom-Json
+$tokens = {tokens_ps}
 Get-Service -ErrorAction SilentlyContinue | Where-Object {{
   $n = ($_.Name + ' ' + $_.DisplayName).ToLowerInvariant()
   $hit = $false
@@ -261,10 +271,10 @@ pub fn list_related_tasks(tokens: &[String]) -> Vec<RelatedTask> {
     if tokens.is_empty() {
         return Vec::new();
     }
-    let tokens_json = serde_json::to_string(tokens).unwrap_or_else(|_| "[]".into());
+    let tokens_ps = ps_string_array(tokens);
     let script = format!(
         r#"
-$tokens = {tokens_json} | ConvertFrom-Json
+$tokens = {tokens_ps}
 Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {{
   $n = ($_.TaskName + ' ' + $_.TaskPath).ToLowerInvariant()
   $hit = $false
@@ -350,6 +360,20 @@ mod tests {
         let t = tokens_from_name("Foo Bar-App 12");
         assert!(t.iter().any(|x| x == "Foo"));
         assert!(t.iter().any(|x| x == "Bar-App") || t.iter().any(|x| x == "Bar"));
+    }
+
+    #[test]
+    fn ps_string_array_is_injection_safe() {
+        let items = vec![
+            r"c:\apps\evil $(whoami)".to_string(),
+            r"c:\apps\o'brien".to_string(),
+            "c:\\apps\\`tick`".to_string(),
+        ];
+        let literal = ps_string_array(&items);
+        // 单引号字面量内不发生插值；单引号本身成对转义。
+        assert!(literal.starts_with("@('c:\\apps\\evil $(whoami)'"));
+        assert!(literal.contains("'c:\\apps\\o''brien'"));
+        assert!(!literal.contains('"'));
     }
 
     #[test]

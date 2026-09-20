@@ -1,10 +1,12 @@
 //! 远程更新：对齐 DeskReader / jiaoben app-update，本机自动下载热替换 + SHA256 校验
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 pub const APP_VERSION_NAME: &str = env!("CARGO_PKG_VERSION");
 include!(concat!(env!("OUT_DIR"), "/version_code.rs"));
@@ -13,6 +15,12 @@ pub const MAX_UPDATE_BYTES: u64 = 300 * 1024 * 1024;
 /// 正式域名：HTTPS → Nginx → jiaoben（勿带 :8687）。历史花生壳域名 / 直连 IP 由
 /// rewrite_public_host 统一重写到这里。
 pub const DEFAULT_API_BASE: &str = "https://jiaoben.lidashuai.top";
+
+/// 发布清单 Ed25519 公钥（hex）。私钥不在仓库内：打包时用
+/// `dj-manifest-sign sign <app-update.json> --key <私钥文件>` 签名。
+/// 轮换密钥：`dj-manifest-sign gen` 生成新对，替换此常量并妥善保管私钥。
+pub const MANIFEST_PUBLIC_KEY_HEX: &str =
+    "e2e55ebef1a6e3b83110e2a75081657f7285ceec43195f81cc7c0a5005424053";
 
 /// 历史占位（`YOUR_SERVER_IP`）与直连 IP 写法 → 统一到正式域名。
 ///
@@ -43,6 +51,8 @@ pub struct RemoteManifest {
     pub url: String,
     pub changelog: String,
     pub sha256: String,
+    /// 发布方对 `manifest_signed_message` 的 Ed25519 签名（hex），缺失即拒绝。
+    pub sig: String,
 }
 
 impl RemoteManifest {
@@ -55,9 +65,62 @@ impl RemoteManifest {
     }
 }
 
-/// 清单签名验证扩展点。staged 版本传入 `None`，后续可注入强制签名验证实现。
+/// 清单签名验证扩展点；生产路径默认使用内置公钥（EmbeddedManifestSigner）。
 pub trait ManifestSignatureVerifier {
     fn verify(&self, manifest: &RemoteManifest) -> Result<(), String>;
+}
+
+/// 被签名的规范字节。签名工具与校验必须共用此函数，改格式需同步升级签名流程。
+pub fn manifest_signed_message(m: &RemoteManifest) -> Vec<u8> {
+    format!(
+        "djmanifest|v1|{}|{}|{}|{}|{}",
+        m.version_code, m.version_name, m.url, m.sha256, m.changelog
+    )
+    .into_bytes()
+}
+
+pub fn sign_manifest_with(manifest: &mut RemoteManifest, secret_seed_hex: &str) -> Result<(), String> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let seed_bytes = hex::decode(secret_seed_hex.trim())
+        .map_err(|e| format!("私钥不是合法 hex：{e}"))?;
+    let seed: [u8; 32] = seed_bytes
+        .try_into()
+        .map_err(|_| "私钥必须是 32 字节种子".to_string())?;
+    let key = SigningKey::from_bytes(&seed);
+    let sig = key.sign(&manifest_signed_message(manifest));
+    manifest.sig = hex::encode(sig.to_bytes());
+    Ok(())
+}
+
+pub fn verify_manifest_signature(
+    manifest: &RemoteManifest,
+    public_key_hex: &str,
+) -> Result<(), String> {
+    if manifest.sig.trim().is_empty() {
+        return Err("更新清单缺少签名（sig），已拒绝。请升级发布流程为清单签名。".into());
+    }
+    let pk_bytes = hex::decode(public_key_hex.trim())
+        .map_err(|e| format!("清单公钥不是合法 hex：{e}"))?;
+    let pk: [u8; 32] = pk_bytes
+        .try_into()
+        .map_err(|_| "清单公钥必须是 32 字节".to_string())?;
+    let verifying =
+        VerifyingKey::from_bytes(&pk).map_err(|e| format!("清单公钥非法：{e}"))?;
+    let sig_bytes = hex::decode(manifest.sig.trim())
+        .map_err(|e| format!("清单签名不是合法 hex：{e}"))?;
+    let signature = Signature::from_slice(&sig_bytes)
+        .map_err(|e| format!("清单签名格式非法：{e}"))?;
+    verifying
+        .verify(&manifest_signed_message(manifest), &signature)
+        .map_err(|_| "清单签名验证失败：内容可能已被篡改".to_string())
+}
+
+pub struct EmbeddedManifestSigner;
+
+impl ManifestSignatureVerifier for EmbeddedManifestSigner {
+    fn verify(&self, manifest: &RemoteManifest) -> Result<(), String> {
+        verify_manifest_signature(manifest, MANIFEST_PUBLIC_KEY_HEX)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +294,15 @@ impl AppConfig {
             self.update_api_base = DEFAULT_API_BASE.to_string();
             return;
         }
+        // 清单源必须 HTTPS：明文 http 下中间人可同时改 url 与 sha256，等同任意投毒。
+        let is_https = base
+            .get(.."https://".len())
+            .map(|p| p.eq_ignore_ascii_case("https://"))
+            .unwrap_or(false);
+        if !is_https {
+            self.update_api_base = DEFAULT_API_BASE.to_string();
+            return;
+        }
         while base.ends_with('/') {
             base.pop();
         }
@@ -315,8 +387,17 @@ fn fetch_best_update(base: &str) -> Result<Option<RemoteManifest>, String> {
     Ok(best.map(|(_, m)| m))
 }
 
+fn api_agent() -> ureq::Agent {
+    // 无超时的请求会永久挂住后台线程：连接 10s、读 15s。
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(15))
+        .build()
+}
+
 fn fetch_one(url: &str) -> Result<Option<RemoteManifest>, String> {
-    let resp = match ureq::get(url)
+    let resp = match api_agent()
+        .get(url)
         .set(
             "User-Agent",
             concat!("disk-janitor/", env!("CARGO_PKG_VERSION")),
@@ -347,7 +428,7 @@ fn fetch_one(url: &str) -> Result<Option<RemoteManifest>, String> {
     Ok(Some(manifest))
 }
 
-fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
+pub fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
     if !v.is_object() {
         return None;
     }
@@ -397,12 +478,20 @@ fn parse_update_payload(v: &serde_json::Value) -> Option<RemoteManifest> {
     if version_code == 0 && version_name.is_empty() && url.is_empty() {
         return None;
     }
+    let sig = v
+        .get("sig")
+        .or_else(|| v.get("signature"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     Some(RemoteManifest {
         version_code,
         version_name,
         url,
         changelog,
         sha256,
+        sig,
     })
 }
 
@@ -500,10 +589,10 @@ pub fn validate_remote_manifest(
 ) -> Result<(), String> {
     validate_https_url(&manifest.url)?;
     validate_sha256(&manifest.sha256)?;
-    if let Some(verifier) = signature_verifier {
-        verifier.verify(manifest)?;
-    }
-    Ok(())
+    // 缺省即内置公钥校验：签名不可选，防止“能改清单者同时改 sha256”的投毒路径。
+    let embedded = EmbeddedManifestSigner;
+    let verifier = signature_verifier.unwrap_or(&embedded);
+    verifier.verify(manifest)
 }
 
 fn is_allowed_binary_content_type(value: Option<&str>) -> bool {
@@ -588,7 +677,12 @@ pub fn download_and_apply(manifest: &RemoteManifest) -> Result<String, String> {
     let script = dir.join("disk-janitor-apply-update.cmd");
     let restore_script = dir.join("disk-janitor-restore-previous.cmd");
 
-    let resp = ureq::get(manifest.url.trim())
+    let resp = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        // 大文件下载：只限制块间空闲时间，不限制总时长。
+        .timeout_read(Duration::from_secs(60))
+        .build()
+        .get(manifest.url.trim())
         .set(
             "User-Agent",
             concat!("disk-janitor/", env!("CARGO_PKG_VERSION")),
@@ -718,6 +812,7 @@ mod tests {
             url: "https://x/a.exe".into(),
             changelog: String::new(),
             sha256: "a".repeat(64),
+            sig: String::new(),
         };
         assert!(need_update(&by_code));
 
@@ -727,6 +822,7 @@ mod tests {
             url: "https://x/a.exe".into(),
             changelog: String::new(),
             sha256: "b".repeat(64),
+            sig: String::new(),
         };
         assert!(!need_update(&same));
     }
@@ -827,12 +923,23 @@ mod tests {
     #[test]
     fn normalize_strips_json_path() {
         let mut c = AppConfig {
-            update_api_base: "http://h:8687/disk-janitor/latest.json".into(),
+            update_api_base: "https://h.example/disk-janitor/latest.json".into(),
             check_on_start: true,
             ..Default::default()
         };
         c.normalize();
-        assert_eq!(c.update_api_base, "http://h:8687");
+        assert_eq!(c.update_api_base, "https://h.example");
+    }
+
+    #[test]
+    fn normalize_rejects_http_base() {
+        // 明文 http 更新源等于给中间人开放投毒面，必须回落到默认 HTTPS 域名。
+        let mut c = AppConfig {
+            update_api_base: "http://h:8687/disk-janitor/latest.json".into(),
+            ..Default::default()
+        };
+        c.normalize();
+        assert_eq!(c.update_api_base, DEFAULT_API_BASE);
     }
 
     #[test]
@@ -847,7 +954,8 @@ mod tests {
     }
 
     #[test]
-    fn validates_manifest_with_optional_signature_verifier() {
+    fn manifest_requires_valid_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
         struct Reject;
         impl ManifestSignatureVerifier for Reject {
             fn verify(&self, _: &RemoteManifest) -> Result<(), String> {
@@ -860,9 +968,27 @@ mod tests {
             url: "https://example.test/update.exe".into(),
             changelog: String::new(),
             sha256: "c".repeat(64),
+            sig: String::new(),
         };
-        assert!(validate_remote_manifest(&manifest, None).is_ok());
+        // 缺签名：默认内置公钥校验直接拒绝。
+        assert!(validate_remote_manifest(&manifest, None).is_err());
         assert!(validate_remote_manifest(&manifest, Some(&Reject)).is_err());
+
+        // 正确签名：用测试密钥对全链路验证（公钥注入，测试不需要发布私钥）。
+        let seed = [7u8; 32];
+        let key = SigningKey::from_bytes(&seed);
+        let mut signed = manifest.clone();
+        signed.sig = hex::encode(
+            key.sign(&manifest_signed_message(&signed)).to_bytes(),
+        );
+        let pub_hex = hex::encode(key.verifying_key().to_bytes());
+        assert!(verify_manifest_signature(&signed, &pub_hex).is_ok());
+        // 换任何人签都不行（内置公钥不匹配）。
+        assert!(verify_manifest_signature(&signed, MANIFEST_PUBLIC_KEY_HEX).is_err());
+        // 篡改内容后签名失效。
+        let mut tampered = signed.clone();
+        tampered.url = "https://evil.test/update.exe".into();
+        assert!(verify_manifest_signature(&tampered, &pub_hex).is_err());
     }
 
     #[test]

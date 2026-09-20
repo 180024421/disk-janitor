@@ -6,9 +6,17 @@ description = "大帅清理器 — 轻量高速磁盘分析与清理"
 license = "MIT"
 publish = false
 
+[lib]
+name = "disk_janitor"
+path = "src/lib.rs"
+
 [[bin]]
 name = "disk-janitor"
 path = "src/main.rs"
+
+[[bin]]
+name = "dj-manifest-sign"
+path = "tools/manifest_sign_main.rs"
 
 [[bin]]
 name = "dashuai-cleaner-setup"

@@ -42,6 +42,20 @@ $json = ($obj | ConvertTo-Json -Depth 5) + "`n"
 $dir = Join-Path $root "deploy"
 if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 $utf8 = New-Object System.Text.UTF8Encoding $false
-[System.IO.File]::WriteAllText((Join-Path $dir "app-update.json"), $json, $utf8)
-Copy-Item -Force (Join-Path $dir "app-update.json") (Join-Path $root "release\app-update.json")
-Write-Host "[OK] app-update.json sha256=$sha displayName=$displayName"
+$manifestPath = Join-Path $dir "app-update.json"
+[System.IO.File]::WriteAllText($manifestPath, $json, $utf8)
+
+# ---- 清单 Ed25519 签名：私钥不在仓库，由打包机持有 ----
+# 私钥位置：--SignKeyFile 参数 > $env:DJ_MANIFEST_SIGN_KEY > %LOCALAPPDATA%\disk-janitor-release\manifest-sign.key
+$signer = Join-Path $root "target\release\dj-manifest-sign.exe"
+if (-not (Test-Path $signer)) {
+  cargo build --release --bin dj-manifest-sign
+  if ($LASTEXITCODE -ne 0) { throw "build dj-manifest-sign failed" }
+}
+& $signer sign $manifestPath
+if ($LASTEXITCODE -ne 0) { throw "manifest signing failed; unsigned manifests are rejected by clients >= 0.9.8" }
+& $signer verify $manifestPath
+if ($LASTEXITCODE -ne 0) { throw "manifest signature verify failed" }
+
+Copy-Item -Force $manifestPath (Join-Path $root "release\app-update.json")
+Write-Host "[OK] app-update.json sha256=$sha signed displayName=$displayName"

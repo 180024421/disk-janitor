@@ -21,6 +21,10 @@ pub struct LicenseCache {
     pub ticket_expire_at: i64,
     #[serde(default)]
     pub paid_last_seen_at: i64,
+    /// paid_last_seen_at 的完整性摘要（HMAC）。明文 JSON 时代可直接改锚点配合
+    /// 时钟回拨让过期票据复活；篡改即视为回拨攻击，强制联网。
+    #[serde(default)]
+    pub guard: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,22 +72,84 @@ fn cache_path() -> PathBuf {
     base.join("disk-janitor").join("license.json")
 }
 
+const GUARD_PEPPER: &str = "dj-license-guard-v1";
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const B: usize = 64;
+    let mut k = [0u8; B];
+    if key.len() > B {
+        let d = Sha256::digest(key);
+        k[..32].copy_from_slice(&d);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; B];
+    let mut opad = [0x5cu8; B];
+    for i in 0..B {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let inner = {
+        let mut h = Sha256::new();
+        h.update(ipad);
+        h.update(msg);
+        h.finalize()
+    };
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn cache_guard(cache: &LicenseCache) -> String {
+    // 盐绑定设备指纹：整份 license.json 拷到别的机器也无法通过。
+    let key = format!(
+        "{GUARD_PEPPER}|{}",
+        device_fingerprint()
+    );
+    let msg = format!(
+        "{}|{}|{}",
+        cache.paid_last_seen_at, cache.ticket_expire_at, cache.ticket
+    );
+    hex::encode(hmac_sha256(key.as_bytes(), msg.as_bytes()))
+}
+
 pub fn load_cache() -> LicenseCache {
     let p = cache_path();
-    fs::read_to_string(&p)
+    let cache: LicenseCache = fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if cache.ticket.is_empty() && cache.paid_last_seen_at == 0 {
+        return cache;
+    }
+    if cache.guard.is_empty() {
+        // 0.9.7 升级兼容：旧档没有 guard 字段，采信锚点（钳到不高于当前时间）并补写。
+        let mut legacy = cache.clone();
+        let now = now_ms();
+        if legacy.paid_last_seen_at > now {
+            legacy.paid_last_seen_at = now;
+        }
+        save_cache(&legacy);
+        return legacy;
+    }
+    if cache.guard != cache_guard(&cache) {
+        // 锚点被手改/文件被拷贝：按时间攻击处理，清档强制联网复核。
+        clear_cache();
+        return LicenseCache::default();
+    }
+    cache
 }
 
 pub fn save_cache(cache: &LicenseCache) {
     let p = cache_path();
+    let mut fixed = cache.clone();
+    fixed.guard = cache_guard(&fixed);
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(s) = serde_json::to_string_pretty(cache) {
-        let _ = fs::write(p, s);
-    }
+    // 原子写，避免半写坏档被当成篡改。
+    let _ = crate::persistence::save_json(&p, &fixed, false);
 }
 
 pub fn clear_cache() {
@@ -195,7 +261,9 @@ pub fn verify_ticket(ticket: &str, raw_fp: &str) -> Result<i64, String> {
 fn guard_clock(cache: &mut LicenseCache) -> Result<(), String> {
     let now = now_ms();
     let prev = cache.paid_last_seen_at;
-    const ROLLBACK_MS: i64 = 2 * 60 * 60 * 1000;
+    // 锚点已有 HMAC 防手改，阈值从 2 小时收紧到 30 分钟：
+    // 只容忍时区/夏令时/NTP 步进级别的抖动，不再容忍“拨回 1 小时续命”。
+    const ROLLBACK_MS: i64 = 30 * 60 * 1000;
     if prev > 0 && now + 60_000 < prev - ROLLBACK_MS {
         clear_cache();
         return Err("检测到系统时间异常，授权已锁定".into());
@@ -409,6 +477,7 @@ fn post_action(action: &str, card_code: Option<&str>) -> Result<LicenseStatus, S
             ticket: ticket.clone(),
             ticket_expire_at: exp,
             paid_last_seen_at: now_ms(),
+            guard: String::new(), // save_cache 会统一补算
         };
         guard_clock(&mut cache)?;
         save_cache(&cache);
