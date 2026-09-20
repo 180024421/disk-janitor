@@ -360,6 +360,20 @@ pub fn expand_count_only_dir<F>(
 where
     F: FnMut(ScanEvent),
 {
+    expand_count_only_dir_ex(root_index, expand_dir, cancel, ScanOptions::default(), on_event)
+}
+
+/// 带选项版本：必须透传初次扫描的 excludes/turbo，否则被排除的敏感子树会重新扫进索引。
+pub fn expand_count_only_dir_ex<F>(
+    root_index: ScanIndex,
+    expand_dir: PathBuf,
+    cancel: Arc<AtomicBool>,
+    opts: ScanOptions,
+    on_event: F,
+) -> ScanIndex
+where
+    F: FnMut(ScanEvent),
+{
     let started = Instant::now();
     let root = root_index.root.clone();
     let expand_key = ScanIndex::key_norm(&expand_dir);
@@ -426,7 +440,7 @@ where
         notes,
         started,
         cancel,
-        ScanOptions::default(),
+        opts,
         on_event,
     )
 }

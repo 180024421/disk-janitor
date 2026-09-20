@@ -105,8 +105,18 @@ fn classify_orphan(
     }
 
     if let Some(exe) = extract_exe_path(&uninstall) {
-        if path_missing(&exe) {
-            reasons.push(format!("卸载程序不存在: {}", exe.display()));
+        // 相对路径（“uninstall.exe /S” 这类写法）以 InstallLocation 为基准；两者皆无则不判缺失。
+        let resolved = if exe.is_absolute() {
+            Some(exe)
+        } else if !loc.is_empty() {
+            Some(std::path::Path::new(&expand_env(loc)).join(&exe))
+        } else {
+            None
+        };
+        if let Some(r) = resolved {
+            if path_missing(&r) {
+                reasons.push(format!("卸载程序不存在: {}", r.display()));
+            }
         }
     }
 

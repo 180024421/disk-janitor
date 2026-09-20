@@ -47,7 +47,13 @@ mod mtime_serde {
         D: Deserializer<'de>,
     {
         let v = Option::<u64>::deserialize(d)?;
-        Ok(v.map(|secs| UNIX_EPOCH + Duration::from_secs(secs)))
+        // 损坏/篡改缓存里的超大值不能 panic，否则绕过 corrupt 保全流程。
+        v.map(|secs| {
+            UNIX_EPOCH.checked_add(Duration::from_secs(secs)).ok_or_else(|| {
+                serde::de::Error::custom(format!("mtime out of range: {secs}"))
+            })
+        })
+        .transpose()
     }
 }
 
@@ -194,33 +200,64 @@ impl ScanIndex {
 
     /// 删除路径及其子孙，并从祖先目录扣减占用
     pub fn remove_cascade(&mut self, path: &Path) {
-        let key = Self::key(path);
-        let key_l = key.to_ascii_lowercase();
-        let size = self
-            .entries
-            .get(&key)
-            .or_else(|| {
-                self.entries
+        self.remove_cascade_batch(std::iter::once(path));
+    }
+
+    /// 批量级联删除：一次扫描找出全部子孙并重建子索引。
+    /// 删除 N 项时避免逐项 O(entries) 扫描 + 逐项 rebuild_children 的卡顿。
+    pub fn remove_cascade_batch<'a, P>(&mut self, paths: impl IntoIterator<Item = &'a P>)
+    where
+        P: AsRef<Path> + ?Sized + 'a,
+    {
+        // (小写精确 key, 小写子树前缀)
+        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut seen_del: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for p in paths {
+            let key_l = Self::key(p.as_ref()).to_ascii_lowercase();
+            if key_l.is_empty() || !seen_del.insert(key_l.clone()) {
+                continue;
+            }
+            let prefix = if key_l.ends_with('\\') {
+                key_l.clone()
+            } else {
+                format!("{key_l}\\")
+            };
+            targets.push((key_l, prefix));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        // 一次遍历收集待删项；命中项（未被其它删除项覆盖的）体积沿祖先链扣减，
+        // 与逐项 remove_cascade 语义一致（盘符根 key 需二次归一才能命中）。
+        let mut doomed: Vec<String> = Vec::new();
+        let mut delta: HashMap<String, u64> = HashMap::new();
+        for (k, e) in self.entries.iter() {
+            let kl = k.to_ascii_lowercase();
+            let exact = targets.iter().find(|(key_l, _)| key_l == &kl);
+            if let Some((own_key, _)) = exact {
+                doomed.push(k.clone());
+                let covered_by_other = targets
                     .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&key))
-                    .map(|(_, v)| v)
-            })
-            .map(|e| e.size)
-            .unwrap_or(0);
-        let prefix = if key_l.ends_with('\\') {
-            key_l.clone()
-        } else {
-            format!("{}\\", key_l)
-        };
-        let doomed: Vec<String> = self
-            .entries
-            .keys()
-            .filter(|k| {
-                let kk = k.to_ascii_lowercase();
-                kk == key_l || kk.starts_with(&prefix)
-            })
-            .cloned()
-            .collect();
+                    .any(|(other_key, prefix)| other_key != own_key && kl.starts_with(prefix));
+                if covered_by_other {
+                    continue;
+                }
+                for anc in e.path.ancestors().skip(1) {
+                    if anc.as_os_str().is_empty() {
+                        break;
+                    }
+                    let raw = Self::key(anc);
+                    let ak = Self::key(Path::new(&raw));
+                    *delta.entry(ak).or_default() += e.size;
+                }
+            } else if targets.iter().any(|(_, prefix)| kl.starts_with(prefix)) {
+                doomed.push(k.clone());
+            }
+        }
+        // 祖先本身也被整体删除时，其扣减由更上层完成，丢弃中间项
+        let doomed_l: std::collections::HashSet<String> =
+            doomed.iter().map(|k| k.to_ascii_lowercase()).collect();
+        delta.retain(|ak, _| !doomed_l.contains(&ak.to_ascii_lowercase()));
         for k in doomed {
             if let Some(e) = self.entries.remove(&k) {
                 if e.is_dir {
@@ -230,22 +267,21 @@ impl ScanIndex {
                 }
             }
         }
-        for anc in path.ancestors().skip(1) {
-            if anc.as_os_str().is_empty() {
-                break;
-            }
-            let ak = Self::key(anc);
-            if let Some(e) = self.entries.get_mut(&ak) {
+        for (pk, d) in delta {
+            if let Some(e) = self.entries.get_mut(&pk) {
                 if e.is_dir {
-                    e.size = e.size.saturating_sub(size);
+                    e.size = e.size.saturating_sub(d);
                 }
-            } else if let Some((_, e)) = self
+                continue;
+            }
+            let pkl = pk.to_ascii_lowercase();
+            if let Some((_, e)) = self
                 .entries
                 .iter_mut()
-                .find(|(k, _)| k.eq_ignore_ascii_case(&ak))
+                .find(|(k, _)| k.to_ascii_lowercase() == pkl)
             {
                 if e.is_dir {
-                    e.size = e.size.saturating_sub(size);
+                    e.size = e.size.saturating_sub(d);
                 }
             }
         }
@@ -367,4 +403,78 @@ pub fn is_sensitive_path(path: &Path) -> bool {
         "\\syswow64",
     ];
     needles.iter().any(|n| s.contains(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(path: &str, size: u64) -> FsEntry {
+        FsEntry {
+            path: PathBuf::from(path),
+            name: "x".into(),
+            is_dir: true,
+            size,
+            mtime: None,
+            count_only: false,
+        }
+    }
+
+    fn file(path: &str, size: u64) -> FsEntry {
+        FsEntry {
+            path: PathBuf::from(path),
+            name: "x".into(),
+            is_dir: false,
+            size,
+            mtime: None,
+            count_only: false,
+        }
+    }
+
+    fn idx(entries: Vec<(&str, FsEntry)>) -> ScanIndex {
+        ScanIndex {
+            entries: entries
+                .into_iter()
+                .map(|(k, e)| (ScanIndex::key(Path::new(k)), e))
+                .collect(),
+            ..ScanIndex::default()
+        }
+    }
+
+    #[test]
+    fn batch_removes_subtrees_and_deducts_parents_once() {
+        let mut index = idx(vec![
+            ("C:\\", dir("C:\\", 1000)),
+            ("C:\\root", dir("C:\\root", 600)),
+            ("C:\\root\\a", dir("C:\\root\\a", 300)),
+            ("C:\\root\\a\\f1.txt", file("C:\\root\\a\\f1.txt", 300)),
+            ("C:\\root\\b", dir("C:\\root\\b", 300)),
+            ("C:\\root\\b\\f2.txt", file("C:\\root\\b\\f2.txt", 300)),
+            ("C:\\root\\keep.txt", file("C:\\root\\keep.txt", 0)),
+        ]);
+        let targets = [
+            PathBuf::from("C:\\root\\a"),
+            PathBuf::from("C:\\root\\a\\f1.txt"), // 被上层覆盖，不应重复扣减
+            PathBuf::from("C:\\root\\b"),
+        ];
+        index.remove_cascade_batch(&targets);
+        assert!(index.get(Path::new("C:\\root\\a")).is_none());
+        assert!(index.get(Path::new("C:\\root\\b")).is_none());
+        assert!(index.get(Path::new("C:\\root\\a\\f1.txt")).is_none());
+        assert_eq!(index.get(Path::new("C:\\root")).unwrap().size, 0);
+        assert_eq!(index.get(Path::new("C:\\")).unwrap().size, 400);
+        // children 不再指向已删除目录
+        assert!(index.children_of(Path::new("C:\\root\\a")).is_empty());
+    }
+
+    #[test]
+    fn batch_handles_case_insensitive_keys() {
+        let mut index = idx(vec![
+            ("C:\\Mix", dir("C:\\Mix", 500)),
+            ("C:\\Mix\\f.txt", file("C:\\Mix\\f.txt", 500)),
+        ]);
+        index.remove_cascade_batch(&[PathBuf::from("c:\\mix")]);
+        assert!(index.get(Path::new("C:\\Mix")).is_none());
+        assert!(index.get(Path::new("C:\\Mix\\f.txt")).is_none());
+    }
 }

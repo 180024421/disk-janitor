@@ -98,6 +98,57 @@ macro_rules! rule {
     };
 }
 
+/// 规则要求“清理前退出”的可执行进程名（小写）。清理会整目录删除，
+/// 进程运行中新写入的文件会一起消失，故执行前必须拦截。
+pub fn processes_to_close_for_rule(rule_id: &str) -> &'static [&'static str] {
+    match rule_id {
+        "chrome_cache" | "chrome_cache_profiles" | "chrome_cookies" | "chrome_history" => {
+            &["chrome.exe"]
+        }
+        "edge_cache" | "edge_profile_cache" | "edge_cookies" | "edge_history" => &["msedge.exe"],
+        "firefox_cache" => &["firefox.exe"],
+        "wechat_cache" => &["weixin.exe", "wechat.exe"],
+        "qq_cache" => &["qq.exe"],
+        "wps_cache" => &["wps.exe", "et.exe", "wpp.exe"],
+        "vscode_cache" => &["code.exe"],
+        "jetbrains_cache" => &[
+            "idea64.exe",
+            "pycharm64.exe",
+            "webstorm64.exe",
+            "goland64.exe",
+            "clion64.exe",
+            "rider64.exe",
+            "datagrip64.exe",
+            "phpstorm64.exe",
+            "studio64.exe",
+        ],
+        "steam_cache" => &["steam.exe"],
+        _ => &[],
+    }
+}
+
+/// 全量进程名快照（小写）。None 表示探测失败——调用方不得把失败当成“进程未运行”。
+pub fn running_process_names() -> Option<std::collections::HashSet<String>> {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names = std::collections::HashSet::new();
+    for line in text.lines() {
+        if let Some(first) = line.split(',').next() {
+            let name = first.trim().trim_matches('"').to_ascii_lowercase();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+    }
+    Some(names)
+}
+
 const RULES: &[JunkRule] = &[
     rule!(
         "user_temp",

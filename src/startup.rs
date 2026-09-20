@@ -396,8 +396,16 @@ fn startup_approved_enabled(hive: &str, reg_key: &str, name: &str) -> bool {
     let Ok(value) = key.get_raw_value(name) else {
         return true;
     };
+    // 旧 12 字节格式启用/禁用标志在偏移 0；Win10/11 任务管理器写 60/64 字节 blob，
+    // 标志在偏移 8（0x02 启用 / 0x03 禁用）。只读首字节会把新格式误读成“已禁用”。
+    let bytes = &value.bytes;
+    let flag = if (60..=64).contains(&bytes.len()) {
+        bytes.get(8).copied().unwrap_or(2)
+    } else {
+        bytes.first().copied().unwrap_or(2)
+    };
     // Windows 当前使用 3 表示禁用；缺失及其它状态按启用处理。
-    value.bytes.first().copied() != Some(3)
+    flag != 3
 }
 
 fn set_startup_approved(

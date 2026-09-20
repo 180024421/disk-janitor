@@ -155,8 +155,25 @@ pub fn extract_exe_path(s: &str) -> Option<PathBuf> {
     if lower.contains("msiexec") {
         return None;
     }
-    let token = s.split_whitespace().next()?;
-    let token = token.split(',').next().unwrap_or(token).trim();
+    // 未加引号且路径含空格（大量安装器写法）：逐段延长前缀，取最后一个真实存在的路径。
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut longest: Option<PathBuf> = None;
+    for i in 0..tokens.len() {
+        let joined = tokens[..=i].join(" ");
+        let joined = joined.split(',').next().unwrap_or(&joined).trim();
+        if joined.is_empty() {
+            continue;
+        }
+        let candidate = PathBuf::from(expand_env(joined));
+        if candidate.exists() {
+            longest = Some(candidate);
+        }
+    }
+    if let Some(p) = longest {
+        return Some(p);
+    }
+    // 全都不存在：退回首个 token 作为“缺失”候选，由调用方判断。
+    let token = tokens.first()?.split(',').next().unwrap_or(tokens[0]).trim();
     if token.is_empty() {
         return None;
     }
@@ -205,6 +222,24 @@ mod tests {
     fn extract_quoted_exe() {
         let p = extract_exe_path(r#""C:\Program Files\App\uninstall.exe" /S"#).unwrap();
         assert_eq!(p, PathBuf::from(r"C:\Program Files\App\uninstall.exe"));
+    }
+
+    #[test]
+    fn extract_unquoted_path_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("Program Files").join("My App");
+        std::fs::create_dir_all(&deep).unwrap();
+        let exe = deep.join("unins000.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let s = format!("{} /S", exe.display());
+        assert_eq!(extract_exe_path(&s).unwrap(), exe);
+    }
+
+    #[test]
+    fn extract_falls_back_to_first_token_when_missing() {
+        // 真实不存在的场景仍返回首段，供上层判“缺失”。
+        let p = extract_exe_path(r"C:\NoSuchDir\App\unins000.exe /S").unwrap();
+        assert_eq!(p, PathBuf::from(r"C:\NoSuchDir\App\unins000.exe"));
     }
 
     #[test]

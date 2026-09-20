@@ -848,9 +848,17 @@ fn is_noise_folder(name: &str) -> bool {
 }
 
 fn norm(p: &Path) -> String {
-    p.to_string_lossy()
-        .trim_end_matches(['\\', '/'])
-        .to_ascii_lowercase()
+    let mut s = p.to_string_lossy().replace('/', "\\");
+    // canonicalize() 带 \\?\ verbatim 前缀，不剥离则与常规路径永不相等，
+    // “已知安装目录”匹配会静默失效。
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = if rest.len() >= 4 && rest[..4].eq_ignore_ascii_case("unc\\") {
+            format!(r"\\{}", &rest[4..])
+        } else {
+            rest.to_string()
+        };
+    }
+    s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
 }
 
 fn dir_size_cap(path: &Path, cancel: &AtomicBool, max_files: u64) -> u64 {
