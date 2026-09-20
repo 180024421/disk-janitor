@@ -406,7 +406,9 @@ pub fn find_duplicates(
         })
         .collect();
 
-    groups.sort_by(|a, b| b.waste().cmp(&a.waste()));
+    // waste() 每个组要按路径逐个查文件 ID（系统调用），排序里重复计算会明显卡顿，
+    // 用缓存 key 保证每组只求值一次。
+    groups.sort_by_cached_key(|g| std::cmp::Reverse(g.waste()));
     if groups.len() > max_groups {
         groups.truncate(max_groups);
     }

@@ -22,8 +22,9 @@ use crate::fast_scan;
 use crate::file_types::{filter_files, FileKind};
 use crate::jobs::{JobKind, JobManager};
 use crate::junk::{
-    apply_safe_selection, filter_excluded_paths, junk_selected_paths, reclaimable_estimate,
-    safe_junk_hits, safe_selected_size, scan_junk, JunkHit,
+    apply_safe_selection, filter_excluded_paths, junk_selected_paths, processes_to_close_for_rule,
+    reclaimable_estimate, running_process_names, safe_junk_hits, safe_selected_size, scan_junk,
+    JunkHit,
 };
 use crate::leftovers::{
     capture_uninstall_snapshot, diff_uninstall_snapshots, scan_leftovers, scan_leftovers_for_app,
@@ -39,7 +40,7 @@ use crate::operation_log;
 use crate::orphans::{delete_orphan_keys, scan_orphan_uninstall_keys, OrphanReg};
 use crate::paths_ui;
 use crate::scan::{
-    expand_count_only_dir, resume_scan, scan_path_ex, ScanEvent, ScanOptions, ScanProgress,
+    expand_count_only_dir_ex, resume_scan_ex, scan_path_ex, ScanEvent, ScanOptions, ScanProgress,
 };
 use crate::schedule;
 use crate::shortcuts::{scan_broken_shortcuts, BrokenShortcut};
@@ -86,6 +87,33 @@ enum WorkerMsg {
     DeepLockDone(Vec<LockingProcess>),
     DeepSvcDone(Vec<RelatedService>, Vec<RelatedTask>),
     AppxDone(Vec<AppxPackage>),
+    DrivesDone(Vec<PathBuf>, Vec<DriveInfo>),
+    RecycleBinDone(Result<(u64, u64, bool), String>),
+    EmptyRecycleDone(Result<String, String>),
+    ShortcutsTrashDone(TrashResult),
+    AppxRemoveDone(Result<(), String>, String),
+    SchedFeedback(SchedFeedback),
+}
+
+/// schtasks / PowerShell 计划任务操作的结果（后台线程产出，UI 线程只做回写）
+pub struct SchedFeedback {
+    pub status: String,
+    /// 需要改写 config.schedule_quiet_clean 时给出目标值
+    pub installed: Option<bool>,
+    pub save_config: bool,
+}
+
+/// 激活页授权操作（激活/刷新/解绑）的后台结果，避免 ureq 请求冻结 UI 线程。
+enum GateMsg {
+    Activated(Result<LicenseStatus, String>),
+    Refreshed(Result<LicenseStatus, String>),
+    Unbound(Result<LicenseStatus, String>),
+}
+
+enum GateAction {
+    Activate(String),
+    Refresh,
+    Unbind,
 }
 
 pub struct JanitorApp {
@@ -108,6 +136,7 @@ pub struct JanitorApp {
     jobs: JobManager<WorkerMsg>,
     update_rx: Option<Receiver<WorkerMsg>>,
     update_worker: Option<JoinHandle<()>>,
+    _misc_worker: Option<JoinHandle<()>>,
     confirm_delete: bool,
     confirm_sensitive: bool,
     last_error: String,
@@ -206,6 +235,12 @@ pub struct JanitorApp {
     license_last_online_check: Option<std::time::Instant>,
     license_last_local_check: Option<std::time::Instant>,
     license_recheck_rx: Option<Receiver<Result<LicenseStatus, String>>>,
+    /// 激活页后台授权请求（解决 UI 线程同步跑 ureq 冻结）
+    license_gate_rx: Option<Receiver<GateMsg>>,
+    /// 盘符/回收站等轻量后台刷新
+    misc_rx: Option<Receiver<WorkerMsg>>,
+    /// 重复组可释放空间合计：waste() 每组都要按路径查文件 ID，缓存避免每帧重算
+    dup_waste: u64,
 }
 
 impl Default for JanitorApp {
@@ -235,6 +270,7 @@ impl Default for JanitorApp {
             jobs: JobManager::default(),
             update_rx: None,
             update_worker: None,
+            _misc_worker: None,
             confirm_delete: false,
             confirm_sensitive: false,
             last_error: String::new(),
@@ -324,6 +360,9 @@ impl Default for JanitorApp {
             license_last_online_check: None,
             license_last_local_check: None,
             license_recheck_rx: None,
+            license_gate_rx: None,
+            misc_rx: None,
+            dup_waste: 0,
         }
     }
 }
@@ -352,14 +391,31 @@ impl JanitorApp {
         app.scan_use_turbo = app.config.scan_mode.eq_ignore_ascii_case("turbo");
         // 粉碎永不作为默认值；尤其 SSD 的磨损均衡会使多遍覆写无法提供可靠保证。
         app.shred_delete = false;
-        match schedule::task_status() {
-            Ok(true) => {
-                app.schedule_status = "✓ 计划任务已安装（DiskJanitorQuietClean）".into();
-                app.config.schedule_quiet_clean = true;
-            }
-            Ok(false) => app.config.schedule_quiet_clean = false,
-            Err(e) => app.schedule_status = format!("⚠ 计划任务状态暂不可用：{e}"),
-        }
+        // 计划任务状态查询要起 schtasks 进程，放后台避免拖慢首帧
+        let (sched_tx, sched_rx) = mpsc::channel();
+        app.misc_rx = Some(sched_rx);
+        app.schedule_status = "正在查询计划任务状态…".into();
+        let sched_handle = std::thread::spawn(move || {
+            let fb = match schedule::task_status() {
+                Ok(true) => SchedFeedback {
+                    status: "✓ 计划任务已安装（DiskJanitorQuietClean）".into(),
+                    installed: Some(true),
+                    save_config: false,
+                },
+                Ok(false) => SchedFeedback {
+                    status: String::new(),
+                    installed: Some(false),
+                    save_config: false,
+                },
+                Err(e) => SchedFeedback {
+                    status: format!("⚠ 计划任务状态暂不可用：{e}"),
+                    installed: None,
+                    save_config: false,
+                },
+            };
+            let _ = sched_tx.send(WorkerMsg::SchedFeedback(fb));
+        });
+        app._misc_worker = Some(sched_handle);
         cc.egui_ctx
             .set_pixels_per_point(app.config.ui_scale.clamp(0.85, 2.0));
         let default_root = dirs_fallback().display().to_string();
@@ -378,28 +434,31 @@ impl JanitorApp {
         if start_path_scan && has_open_path {
             app.start_scan();
         }
-        // 启动授权校验（同步一次；有缓存票则离线可用）
-        match license::fetch_status() {
-            Ok(s) => {
-                app.license_unlocked = s.valid;
+        // 启动授权：只用本地缓存秒开，在线校验交给后台复核，避免冻结首帧
+        match license::read_cached_status() {
+            Some(s) if s.valid => {
+                app.license_unlocked = true;
                 app.license_tip = s.message.clone().unwrap_or_default();
                 app.license_status = Some(s);
             }
-            Err(e) => {
-                if let Some(c) = license::read_cached_status() {
-                    app.license_unlocked = c.valid;
-                    app.license_tip = c.message.clone().unwrap_or_default();
-                    app.license_status = Some(c);
-                } else {
-                    app.license_unlocked = false;
-                    app.license_tip = e;
-                }
+            Some(s) => {
+                app.license_unlocked = false;
+                app.license_tip = s
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "授权已失效，请重新激活".into());
+                app.license_status = Some(s);
+            }
+            None => {
+                app.license_unlocked = false;
+                app.license_tip = "请输入卡密激活".into();
             }
         }
         app
     }
 
     fn ui_license_gate(&mut self, ctx: &egui::Context) {
+        self.poll_license_gate(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::background()))
             .show(ctx, |ui| {
@@ -475,22 +534,8 @@ impl JanitorApp {
                                 })
                                 .inner;
                             if activate.clicked() {
-                                self.license_busy = true;
                                 let code = self.license_card.clone();
-                                match license::redeem(&code) {
-                                    Ok(s) => {
-                                        self.license_unlocked = s.valid;
-                                        self.license_tip = s
-                                            .message
-                                            .clone()
-                                            .unwrap_or_else(|| "激活成功".into());
-                                        self.license_status = Some(s);
-                                    }
-                                    Err(e) => {
-                                        self.license_tip = e;
-                                    }
-                                }
-                                self.license_busy = false;
+                                self.spawn_license_gate(GateAction::Activate(code));
                             }
                             ui.add_space(6.0);
                             ui.vertical_centered(|ui| {
@@ -502,17 +547,7 @@ impl JanitorApp {
                                     )
                                     .clicked()
                                 {
-                                    self.license_busy = true;
-                                    match license::fetch_status() {
-                                        Ok(s) => {
-                                            self.license_unlocked = s.valid;
-                                            self.license_tip =
-                                                s.message.clone().unwrap_or_default();
-                                            self.license_status = Some(s);
-                                        }
-                                        Err(e) => self.license_tip = e,
-                                    }
-                                    self.license_busy = false;
+                                    self.spawn_license_gate(GateAction::Refresh);
                                 }
                                 if ui
                                     .add_enabled(
@@ -521,19 +556,7 @@ impl JanitorApp {
                                     )
                                     .clicked()
                                 {
-                                    self.license_busy = true;
-                                    match license::unbind() {
-                                        Ok(s) => {
-                                            self.license_unlocked = s.valid;
-                                            self.license_tip = s
-                                                .message
-                                                .clone()
-                                                .unwrap_or_else(|| "本机授权已解绑".into());
-                                            self.license_status = Some(s);
-                                        }
-                                        Err(e) => self.license_tip = e,
-                                    }
-                                    self.license_busy = false;
+                                    self.spawn_license_gate(GateAction::Unbind);
                                 }
                                 if ui
                                     .add(theme::link_button("操作文档"))
@@ -619,6 +642,82 @@ impl JanitorApp {
                     });
                 });
             });
+    }
+
+    /// 激活页授权请求放后台线程，结果经 license_gate_rx 回收。
+    fn spawn_license_gate(&mut self, action: GateAction) {
+        if self.license_busy {
+            return;
+        }
+        self.license_busy = true;
+        self.last_error.clear();
+        let (tx, rx) = mpsc::channel();
+        self.license_gate_rx = Some(rx);
+        let msg = match action {
+            GateAction::Activate(code) => {
+                std::thread::spawn(move || {
+                    let _ = tx.send(GateMsg::Activated(license::redeem(&code)));
+                });
+                "正在激活…"
+            }
+            GateAction::Refresh => {
+                std::thread::spawn(move || {
+                    let _ = tx.send(GateMsg::Refreshed(license::fetch_status()));
+                });
+                "正在刷新授权状态…"
+            }
+            GateAction::Unbind => {
+                std::thread::spawn(move || {
+                    let _ = tx.send(GateMsg::Unbound(license::unbind()));
+                });
+                "正在解绑本机…"
+            }
+        };
+        self.license_tip = msg.into();
+    }
+
+    fn poll_license_gate(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.license_gate_rx else {
+            return;
+        };
+        let msg = match rx.try_recv() {
+            Ok(m) => Some(m),
+            Err(mpsc::TryRecvError::Empty) => {
+                // 请求仍在飞行中：持续刷新，直到收到结果或线程断开
+                ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.license_gate_rx = None;
+                self.license_busy = false;
+                self.license_tip = "授权请求已中断，请重试".into();
+                return;
+            }
+        };
+        self.license_gate_rx = None;
+        self.license_busy = false;
+        let Some(msg) = msg else { return };
+        let (res, default_tip) = match msg {
+            GateMsg::Activated(r) => (r, "激活成功"),
+            GateMsg::Refreshed(r) => (r, "授权有效"),
+            GateMsg::Unbound(r) => (r, "本机授权已解绑"),
+        };
+        match res {
+            Ok(s) => {
+                self.license_unlocked = s.valid;
+                self.license_tip = s.message.clone().unwrap_or_else(|| default_tip.into());
+                self.license_status = Some(s);
+                if self.license_unlocked {
+                    // 回到主界面后立刻安排一次复核，失效卡不能靠这次结果长期白嫖
+                    self.license_last_online_check = Some(std::time::Instant::now());
+                    self.license_last_local_check = None;
+                }
+            }
+            Err(e) => {
+                self.license_unlocked = false;
+                self.license_tip = e;
+            }
+        }
     }
 
     /// 扫描/清理等互斥；更新检查独立，不计入 busy
@@ -1065,18 +1164,27 @@ impl JanitorApp {
         self.current_dir = root.clone();
         self.tab = Tab::Browse;
 
+        let excludes = self.scan_excludes();
+        let turbo = self.scan_use_turbo;
         let started = self.jobs.start(JobKind::Scan, move |cancel, tx| {
-            let _idx = resume_scan(root, base, remaining, cancel, |ev| match ev {
-                ScanEvent::Progress(p) => {
-                    let _ = tx.send(WorkerMsg::Progress(p));
-                }
-                ScanEvent::Partial(i) => {
-                    let _ = tx.send(WorkerMsg::Partial(i));
-                }
-                ScanEvent::Done(i) => {
-                    let _ = tx.send(WorkerMsg::Done(i));
-                }
-            });
+            let _idx = resume_scan_ex(
+                root,
+                base,
+                remaining,
+                cancel,
+                |ev| match ev {
+                    ScanEvent::Progress(p) => {
+                        let _ = tx.send(WorkerMsg::Progress(p));
+                    }
+                    ScanEvent::Partial(i) => {
+                        let _ = tx.send(WorkerMsg::Partial(i));
+                    }
+                    ScanEvent::Done(i) => {
+                        let _ = tx.send(WorkerMsg::Done(i));
+                    }
+                },
+                ScanOptions { excludes, turbo },
+            );
         });
         if let Err(error) = started {
             self.scanning = false;
@@ -1096,18 +1204,26 @@ impl JanitorApp {
         self.expand_scanning = Some(dir.clone());
         self.status = format!("正在深入展开 {} …", dir.display());
         self.tab = Tab::Browse;
+        let excludes = self.scan_excludes();
+        let turbo = self.scan_use_turbo;
         let started = self.jobs.start(JobKind::Scan, move |cancel, tx| {
-            let _idx = expand_count_only_dir(base, dir, cancel, |ev| match ev {
-                ScanEvent::Progress(p) => {
-                    let _ = tx.send(WorkerMsg::Progress(p));
-                }
-                ScanEvent::Partial(i) => {
-                    let _ = tx.send(WorkerMsg::Partial(i));
-                }
-                ScanEvent::Done(i) => {
-                    let _ = tx.send(WorkerMsg::Done(i));
-                }
-            });
+            let _idx = expand_count_only_dir_ex(
+                base,
+                dir,
+                cancel,
+                ScanOptions { excludes, turbo },
+                |ev| match ev {
+                    ScanEvent::Progress(p) => {
+                        let _ = tx.send(WorkerMsg::Progress(p));
+                    }
+                    ScanEvent::Partial(i) => {
+                        let _ = tx.send(WorkerMsg::Partial(i));
+                    }
+                    ScanEvent::Done(i) => {
+                        let _ = tx.send(WorkerMsg::Done(i));
+                    }
+                },
+            );
         });
         if let Err(error) = started {
             self.scanning = false;
@@ -1133,7 +1249,17 @@ impl JanitorApp {
         let handle = std::thread::spawn(move || {
             let cancel = AtomicBool::new(false);
             let hits = scan_junk(&cancel);
-            let safe = safe_junk_hits(hits);
+            let mut safe = safe_junk_hits(hits);
+            // 安静清理无人可确认：要求先退出的进程（浏览器等）仍在跑时整条规则丢弃，
+            // 比手动清理的「逐文件跳过占用」更保守。
+            if let Some(running) = running_process_names() {
+                safe.retain(|h| {
+                    !h.requires_process_exit
+                        || processes_to_close_for_rule(&h.rule_id)
+                            .iter()
+                            .all(|p| !running.contains(&p.to_string()))
+                });
+            }
             let paths = filter_excluded_paths(junk_selected_paths(&safe), &excludes);
             let res = if paths.is_empty() {
                 TrashResult::default()
@@ -1145,14 +1271,107 @@ impl JanitorApp {
         self._worker = Some(handle);
     }
 
-    fn refresh_drives(&mut self) {
-        self.drives = list_drives();
-        self.drive_infos = list_drive_infos();
+    fn spawn_schedule_status(&mut self) {
+        self.spawn_schedule(|| match schedule::task_status() {
+            Ok(true) => SchedFeedback {
+                status: "✓ 计划任务已安装（DiskJanitorQuietClean）".into(),
+                installed: Some(true),
+                save_config: false,
+            },
+            Ok(false) => SchedFeedback {
+                status: "○ 未安装计划任务".into(),
+                installed: Some(false),
+                save_config: false,
+            },
+            Err(e) => SchedFeedback {
+                status: format!("⚠ 计划任务状态暂不可用：{e}"),
+                installed: None,
+                save_config: false,
+            },
+        });
+    }
+
+    fn spawn_drives_refresh(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.misc_rx = Some(rx);
+        self.status = "正在刷新盘符…".into();
+        let handle = std::thread::spawn(move || {
+            let drives = list_drives();
+            let infos = list_drive_infos();
+            let _ = tx.send(WorkerMsg::DrivesDone(drives, infos));
+        });
+        self._misc_worker = Some(handle);
+    }
+
+    fn apply_drives_done(&mut self, drives: Vec<PathBuf>, infos: Vec<DriveInfo>) {
+        self.drives = drives;
+        self.drive_infos = infos;
         self.status = format!("已刷新盘符：{} 个", self.drive_infos.len());
     }
 
-    fn refresh_recycle_bin(&mut self) {
-        match recycle_bin_size() {
+    fn spawn_recycle_refresh(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.misc_rx = Some(rx);
+        self.recycle_bin_label = "正在估算回收站…".into();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(WorkerMsg::RecycleBinDone(recycle_bin_size()));
+        });
+        self._misc_worker = Some(handle);
+    }
+
+    /// AppX 卸载走 PowerShell，放后台（UI 线程等它必卡）
+    fn spawn_appx_remove(&mut self, full: String) {
+        if self.misc_rx.is_some() {
+            self.status = "请等当前后台操作结束".into();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.misc_rx = Some(rx);
+        self.status = format!("正在请求卸载 AppX：{full}…");
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(WorkerMsg::AppxRemoveDone(uninstall_appx(&full), full));
+        });
+        self._misc_worker = Some(handle);
+    }
+
+    fn apply_appx_remove_done(&mut self, res: Result<(), String>, full: String) {
+        match res {
+            Ok(()) => {
+                self.status = format!("已请求卸载 AppX：{full}");
+                self.appx_packages.retain(|p| p.package_full_name != full);
+            }
+            Err(e) => self.status = format!("卸载 AppX 失败：{e}"),
+        }
+    }
+
+    /// 通用：把 schtasks / PowerShell 之类的慢操作丢到后台，结果写回 schedule_status。
+    fn spawn_schedule<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> SchedFeedback + Send + 'static,
+    {
+        if self.misc_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.misc_rx = Some(rx);
+        self.schedule_status = "正在处理计划任务…".into();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(WorkerMsg::SchedFeedback(f()));
+        });
+        self._misc_worker = Some(handle);
+    }
+
+    fn apply_sched_feedback(&mut self, fb: SchedFeedback) {
+        self.schedule_status = fb.status;
+        if let Some(installed) = fb.installed {
+            self.config.schedule_quiet_clean = installed;
+        }
+        if fb.save_config {
+            let _ = self.config.save();
+        }
+    }
+
+    fn apply_recycle_done(&mut self, res: Result<(u64, u64, bool), String>) {        match res {
             Ok((sz, n, complete)) => {
                 let quality = if complete {
                     "完整统计"
@@ -1238,10 +1457,36 @@ impl JanitorApp {
             let (_p, _partial, other) = Self::poll_one_rx(rx);
             msgs.extend(other);
         }
+        if let Some(rx) = &self.misc_rx {
+            let (_p, _partial, other) = Self::poll_one_rx(rx);
+            if !other.is_empty() {
+                self.misc_rx = None;
+                self._misc_worker = None;
+                msgs.extend(other);
+            }
+        }
 
         for msg in msgs {
             match msg {
                 WorkerMsg::Progress(_) | WorkerMsg::Partial(_) => {}
+                WorkerMsg::DrivesDone(drives, infos) => {
+                    self.apply_drives_done(drives, infos);
+                }
+                WorkerMsg::RecycleBinDone(res) => {
+                    self.apply_recycle_done(res);
+                }
+                WorkerMsg::EmptyRecycleDone(res) => {
+                    self.apply_empty_recycle_done(res);
+                }
+                WorkerMsg::ShortcutsTrashDone(res) => {
+                    self.apply_shortcuts_trash_done(res);
+                }
+                WorkerMsg::SchedFeedback(fb) => {
+                    self.apply_sched_feedback(fb);
+                }
+                WorkerMsg::AppxRemoveDone(res, full) => {
+                    self.apply_appx_remove_done(res, full);
+                }
                 WorkerMsg::Done(idx) => {
                     self.jobs.finish();
                     self.scanning = false;
@@ -1447,6 +1692,7 @@ impl JanitorApp {
                         format_bytes(waste)
                     );
                     self.dup_groups = groups;
+                    self.dup_waste = waste;
                     self.rx = None;
                 }
                 WorkerMsg::LeftoversDone(hits) => {
@@ -1682,9 +1928,6 @@ impl JanitorApp {
         for p in &res.ok {
             let key = ScanIndex::key(p);
             self.selected.remove(&key);
-            if let Some(idx) = &mut self.index {
-                idx.remove_cascade(p);
-            }
             // 同步从重复组 / 残留列表移除（保持 selected 与 paths 对齐；忽略大小写）
             let del_key = ScanIndex::key_norm(p);
             for g in &mut self.dup_groups {
@@ -1711,6 +1954,13 @@ impl JanitorApp {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| p.display().to_string());
             self.push_log(format!("✓ 已删除 {name}"));
+        }
+        // 批量级联删除：一次扫描 + 一次子索引重建（逐项会卡 UI）
+        if !res.ok.is_empty() {
+            if let Some(idx) = &mut self.index {
+                idx.remove_cascade_batch(&res.ok);
+            }
+            self.dup_waste = self.dup_groups.iter().map(|g| g.waste()).sum();
         }
         for (p, e) in &res.failed {
             let name = p
@@ -1759,12 +2009,54 @@ impl JanitorApp {
         }
     }
 
+    /// 清理前探测「要求先退出」的进程；返回 Some(列表) 表示需要拦截。
+    /// 探测失败返回 None（不误伤）：被占用的文件会在逐层删除时安全跳过。
+    fn junk_blocking_processes(&self) -> Option<Vec<String>> {
+        let mut needed: Vec<&'static str> = Vec::new();
+        for h in &self.junk_hits {
+            if !h.selected || !h.requires_process_exit {
+                continue;
+            }
+            for p in processes_to_close_for_rule(&h.rule_id) {
+                if !needed.contains(p) {
+                    needed.push(p);
+                }
+            }
+        }
+        if needed.is_empty() {
+            return None;
+        }
+        let running = running_process_names()?;
+        let hit: Vec<String> = needed
+            .into_iter()
+            .filter(|p| running.contains(*p))
+            .map(String::from)
+            .collect();
+        if hit.is_empty() {
+            None
+        } else {
+            Some(hit)
+        }
+    }
+
     fn do_junk_clean(&mut self) {
         let paths = filter_excluded_paths(
             junk_selected_paths(&self.junk_hits),
             &self.config.exclude_paths,
         );
         if paths.is_empty() || self.busy() {
+            return;
+        }
+        if let Some(blocking) = self.junk_blocking_processes() {
+            self.confirm_junk = false;
+            self.confirm_safe_clean = false;
+            self.junk_confirm_paths = None;
+            let msg = format!(
+                "已阻止清理：请先关闭 {} 后重试（运行中新写入的文件会随目录一起删除）",
+                blocking.join("、")
+            );
+            self.status = msg.clone();
+            self.last_error = msg;
             return;
         }
         self.confirm_junk = false;
@@ -1834,10 +2126,21 @@ impl JanitorApp {
             .filter(|s| s.selected)
             .map(|s| s.path.clone())
             .collect();
-        if paths.is_empty() {
+        if paths.is_empty() || self.misc_rx.is_some() {
             return;
         }
-        let res = move_to_trash(&paths);
+        self.confirm_shortcuts = false;
+        self.status = format!("正在删除 {} 个失效快捷方式…", paths.len());
+        let (tx, rx) = mpsc::channel();
+        self.misc_rx = Some(rx);
+        let handle = std::thread::spawn(move || {
+            let res = move_to_trash(&paths);
+            let _ = tx.send(WorkerMsg::ShortcutsTrashDone(res));
+        });
+        self._misc_worker = Some(handle);
+    }
+
+    fn apply_shortcuts_trash_done(&mut self, res: TrashResult) {
         self.broken_shortcuts
             .retain(|s| !res.ok.iter().any(|p| p == &s.path));
         self.status = if res.failed.is_empty() {
@@ -1848,7 +2151,6 @@ impl JanitorApp {
         if !res.ok.is_empty() && res.permanent == 0 {
             self.show_recycle_hint = true;
         }
-        self.confirm_shortcuts = false;
     }
 
     fn do_orphans_clean(&mut self) {
@@ -1955,11 +2257,24 @@ impl JanitorApp {
 
     fn do_empty_recycle(&mut self) {
         self.confirm_empty_recycle = false;
-        match empty_recycle_bin() {
+        if self.misc_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.misc_rx = Some(rx);
+        self.status = "正在清空回收站…".into();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(WorkerMsg::EmptyRecycleDone(empty_recycle_bin()));
+        });
+        self._misc_worker = Some(handle);
+    }
+
+    fn apply_empty_recycle_done(&mut self, res: Result<String, String>) {
+        match res {
             Ok(msg) => {
                 self.status = msg.clone();
                 self.push_log(msg);
-                self.refresh_recycle_bin();
+                self.spawn_recycle_refresh();
             }
             Err(e) => {
                 self.status = format!("清空回收站失败：{e}");
@@ -2820,8 +3135,8 @@ impl JanitorApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                // KPI 指标
-                let dup_waste: u64 = self.dup_groups.iter().map(|g| g.waste()).sum();
+                // KPI 指标（dup_waste 在扫描完成/删除后维护，避免每帧重算文件 ID）
+                let dup_waste = self.dup_waste;
                 let junk_safe = safe_selected_size(&self.junk_hits);
                 let junk_total: u64 = self.junk_hits.iter().map(|h| h.size).sum();
                 let reclaim = if self.junk_hits.is_empty() && self.dup_groups.is_empty() {
@@ -2895,7 +3210,7 @@ impl JanitorApp {
                             .on_hover_text("重新统计各盘空间")
                             .clicked()
                         {
-                            self.refresh_drives();
+                            self.spawn_drives_refresh();
                         }
                     });
                 });
@@ -2964,7 +3279,7 @@ impl JanitorApp {
                         }
                         ui.add_space(6.0);
                         if ui.add(theme::ghost_button("刷新")).clicked() {
-                            self.refresh_drives();
+                            self.spawn_drives_refresh();
                         }
                     });
                 });
@@ -3756,17 +4071,8 @@ impl JanitorApp {
                             ui.monospace(&full);
                             ui.horizontal(|ui| {
                                 if ui.button("确认卸载").clicked() {
-                                    match uninstall_appx(&full) {
-                                        Ok(()) => {
-                                            self.status = format!("已请求卸载 AppX：{full}");
-                                            self.appx_packages
-                                                .retain(|p| p.package_full_name != full);
-                                        }
-                                        Err(e) => {
-                                            self.status = format!("卸载 AppX 失败：{e}");
-                                        }
-                                    }
                                     self.pending_appx_remove = None;
+                                    self.spawn_appx_remove(full.clone());
                                 }
                                 if ui.button("取消").clicked() {
                                     self.pending_appx_remove = None;
@@ -4648,7 +4954,7 @@ impl JanitorApp {
                         ui.label(&self.recycle_bin_label);
                         ui.horizontal(|ui| {
                             if ui.add(theme::ghost_button("估算占用")).clicked() {
-                                self.refresh_recycle_bin();
+                                self.spawn_recycle_refresh();
                             }
                             if ui.add(theme::ghost_button("清空回收站")).clicked() {
                                 self.confirm_empty_recycle = true;
@@ -4914,26 +5220,25 @@ impl JanitorApp {
                             );
                             if ui.small_button("保存时间").clicked() {
                                 if self.config.schedule_quiet_clean {
-                                    match std::env::current_exe() {
-                                        Ok(exe) => match schedule::install_daily_task(
-                                            &exe,
-                                            &self.config.schedule_time,
-                                        ) {
-                                            Ok(()) => {
-                                                self.schedule_status =
-                                                    "✓ 已更新计划任务时间".into();
-                                                let _ = self.config.save();
-                                            }
-                                            Err(e) => {
-                                                self.schedule_status =
-                                                    format!("✕ 更新时间失败：{e}");
-                                            }
-                                        },
-                                        Err(e) => {
-                                            self.schedule_status =
-                                                format!("✕ 无法确定程序路径：{e}")
+                                    let time = self.config.schedule_time.clone();
+                                    self.spawn_schedule(move || {
+                                        let exe = std::env::current_exe()
+                                            .map_err(|e| e.to_string());
+                                        match exe
+                                            .and_then(|exe| schedule::install_daily_task(&exe, &time))
+                                        {
+                                            Ok(()) => SchedFeedback {
+                                                status: "✓ 已更新计划任务时间".into(),
+                                                installed: None,
+                                                save_config: true,
+                                            },
+                                            Err(e) => SchedFeedback {
+                                                status: format!("✕ 更新时间失败：{e}"),
+                                                installed: None,
+                                                save_config: false,
+                                            },
                                         }
-                                    }
+                                    });
                                 } else {
                                     let _ = self.config.save();
                                     self.schedule_status =
@@ -4943,47 +5248,50 @@ impl JanitorApp {
                             let mut en = self.config.schedule_quiet_clean;
                             if ui.checkbox(&mut en, "启用每日安静清理").changed() {
                                 self.config.schedule_quiet_clean = en;
-                                let exe = std::env::current_exe().ok();
                                 if en {
-                                    if let Some(exe) = exe {
-                                        match schedule::install_daily_task(
-                                            &exe,
-                                            &self.config.schedule_time,
-                                        ) {
-                                            Ok(()) => {
-                                                self.schedule_status =
-                                                    "✓ 已安装计划任务 DiskJanitorQuietClean".into();
-                                                let _ = self.config.save();
+                                    let time = self.config.schedule_time.clone();
+                                    self.spawn_schedule(move || {
+                                        match std::env::current_exe() {
+                                            Ok(exe) => {
+                                                match schedule::install_daily_task(&exe, &time) {
+                                                    Ok(()) => SchedFeedback {
+                                                        status: "✓ 已安装计划任务 DiskJanitorQuietClean".into(),
+                                                        installed: None,
+                                                        save_config: true,
+                                                    },
+                                                    Err(e) => SchedFeedback {
+                                                        status: format!("✕ 安装失败：{e}"),
+                                                        installed: Some(false),
+                                                        save_config: false,
+                                                    },
+                                                }
                                             }
-                                            Err(e) => {
-                                                self.config.schedule_quiet_clean = false;
-                                                self.schedule_status =
-                                                    format!("✕ 安装失败：{e}");
-                                            }
+                                            Err(_) => SchedFeedback {
+                                                status: "✕ 无法确定当前程序路径，未创建计划任务".into(),
+                                                installed: Some(false),
+                                                save_config: false,
+                                            },
                                         }
-                                    } else {
-                                        self.config.schedule_quiet_clean = false;
-                                        self.schedule_status =
-                                            "✕ 无法确定当前程序路径，未创建计划任务".into();
-                                    }
+                                    });
                                 } else {
-                                    match schedule::remove_daily_task() {
-                                        Ok(()) => {
-                                            self.schedule_status = "✓ 已移除计划任务".into();
-                                            let _ = self.config.save();
-                                        }
-                                        Err(e) => {
-                                            self.config.schedule_quiet_clean = true;
-                                            self.schedule_status = format!("✕ 移除失败：{e}");
-                                        }
-                                    }
+                                    self.spawn_schedule(|| match schedule::remove_daily_task() {
+                                        Ok(()) => SchedFeedback {
+                                            status: "✓ 已移除计划任务".into(),
+                                            installed: None,
+                                            save_config: true,
+                                        },
+                                        Err(e) => SchedFeedback {
+                                            status: format!("✕ 移除失败：{e}"),
+                                            installed: Some(true),
+                                            save_config: false,
+                                        },
+                                    });
                                 }
                             }
                             if ui.small_button("刷新状态").clicked() {
-                                match schedule::task_status() {
-                                    Ok(true) => {
-                                        self.config.schedule_quiet_clean = true;
-                                        self.schedule_status = match schedule::task_info() {
+                                self.spawn_schedule(|| match schedule::task_status() {
+                                    Ok(true) => SchedFeedback {
+                                        status: match schedule::task_info() {
                                             Ok(info) => format!(
                                                 "✓ 已安装 · 上次 {} · 下次 {} · 退出码 {}",
                                                 info.last_run_time,
@@ -4993,16 +5301,21 @@ impl JanitorApp {
                                             Err(e) => {
                                                 format!("⚠ 已安装，但详细状态读取失败：{e}")
                                             }
-                                        };
-                                    }
-                                    Ok(false) => {
-                                        self.config.schedule_quiet_clean = false;
-                                        self.schedule_status = "○ 未安装计划任务".into();
-                                    }
-                                    Err(e) => {
-                                        self.schedule_status = format!("✕ 状态查询失败：{e}");
-                                    }
-                                };
+                                        },
+                                        installed: Some(true),
+                                        save_config: false,
+                                    },
+                                    Ok(false) => SchedFeedback {
+                                        status: "○ 未安装计划任务".into(),
+                                        installed: Some(false),
+                                        save_config: false,
+                                    },
+                                    Err(e) => SchedFeedback {
+                                        status: format!("✕ 状态查询失败：{e}"),
+                                        installed: None,
+                                        save_config: false,
+                                    },
+                                });
                             }
                         });
                         if !self.schedule_status.is_empty() {
@@ -5308,6 +5621,11 @@ impl JanitorApp {
                                         },
                                     );
 
+                                    if e.count_only && e.is_dir {
+                                        if ui.add(theme::link_button("展开")).clicked() {
+                                            expand_path = Some(e.path.clone());
+                                        }
+                                    }
                                     if ui.add(theme::link_button("打开")).clicked() {
                                         open_loc = Some(e.path.clone());
                                     }
