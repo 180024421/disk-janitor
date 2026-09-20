@@ -1,6 +1,6 @@
 [package]
 name = "disk-janitor"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2021"
 description = "大帅清理器 — 轻量高速磁盘分析与清理"
 license = "MIT"
