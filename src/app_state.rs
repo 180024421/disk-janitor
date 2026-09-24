@@ -52,7 +52,8 @@ impl Section {
         match self {
             Section::Home => "🏠",
             Section::Space => "📁",
-            Section::Clean => "🧹",
+            // 不用 🧹：egui 内置的 emoji 字体没有这个码位，会渲染成豆腐块。
+            Section::Clean => "🗑",
             Section::System => "📦",
             Section::Config => "⚙",
         }

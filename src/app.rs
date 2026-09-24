@@ -262,7 +262,7 @@ impl Default for JanitorApp {
             filter: String::new(),
             selected: HashSet::new(),
             status:
-                "欢迎使用大帅清理器。可从「总览」选盘扫描，或用工具清理残留。删除默认进回收站。"
+                "欢迎使用大帅清理器。可从「体检」选盘扫描，或用工具清理残留。删除默认进回收站。"
                     .into(),
             scanning: false,
             progress: None,
@@ -401,7 +401,7 @@ impl JanitorApp {
         let sched_handle = std::thread::spawn(move || {
             let fb = match schedule::task_status() {
                 Ok(true) => SchedFeedback {
-                    status: "✓ 计划任务已安装（DiskJanitorQuietClean）".into(),
+                    status: "√ 计划任务已安装（DiskJanitorQuietClean）".into(),
                     installed: Some(true),
                     save_config: false,
                 },
@@ -1253,7 +1253,7 @@ impl JanitorApp {
     fn spawn_schedule_status(&mut self) {
         self.spawn_schedule(|| match schedule::task_status() {
             Ok(true) => SchedFeedback {
-                status: "✓ 计划任务已安装（DiskJanitorQuietClean）".into(),
+                status: "√ 计划任务已安装（DiskJanitorQuietClean）".into(),
                 installed: Some(true),
                 save_config: false,
             },
@@ -1932,7 +1932,7 @@ impl JanitorApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| p.display().to_string());
-            self.push_log(format!("✓ 已删除 {name}"));
+            self.push_log(format!("√ 已删除 {name}"));
         }
         // 批量级联删除：一次扫描 + 一次子索引重建（逐项会卡 UI）
         if !res.ok.is_empty() {
@@ -1946,7 +1946,7 @@ impl JanitorApp {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| p.display().to_string());
-            self.push_log(format!("✗ 失败 {name}: {e}"));
+            self.push_log(format!("× 失败 {name}: {e}"));
         }
         if res.permanent > 0 {
             self.push_log(format!("ℹ {} 项无法进回收站，已直接删除", res.permanent));
@@ -4867,10 +4867,10 @@ impl JanitorApp {
                             if theme::ghost_button(ui, "Windows 存储设置").clicked() {
                                 match paths_ui::open_storage_settings() {
                                     Ok(()) => {
-                                        self.status = "✓ 已请求打开 Windows 存储设置".into()
+                                        self.status = "√ 已请求打开 Windows 存储设置".into()
                                     }
                                     Err(e) => {
-                                        self.status = format!("✕ {e}");
+                                        self.status = format!("× {e}");
                                         self.last_error = e;
                                     }
                                 }
@@ -4977,6 +4977,7 @@ impl JanitorApp {
                                 ctx.set_pixels_per_point(scales[i].clamp(0.85, 2.0));
                                 let _ = self.config.save();
                             }
+                            ui.weak("1.0 = 100%");
                         });
                         ui.horizontal(|ui| {
                             ui.label("重复文件保留策略");
@@ -5102,12 +5103,12 @@ impl JanitorApp {
                                             .and_then(|exe| schedule::install_daily_task(&exe, &time))
                                         {
                                             Ok(()) => SchedFeedback {
-                                                status: "✓ 已更新计划任务时间".into(),
+                                                status: "√ 已更新计划任务时间".into(),
                                                 installed: None,
                                                 save_config: true,
                                             },
                                             Err(e) => SchedFeedback {
-                                                status: format!("✕ 更新时间失败：{e}"),
+                                                status: format!("× 更新时间失败：{e}"),
                                                 installed: None,
                                                 save_config: false,
                                             },
@@ -5116,7 +5117,7 @@ impl JanitorApp {
                                 } else {
                                     let _ = self.config.save();
                                     self.schedule_status =
-                                        "✓ 已保存时间，启用任务后生效".into();
+                                        "√ 已保存时间，启用任务后生效".into();
                                 }
                             }
                             let mut en = self.config.schedule_quiet_clean;
@@ -5129,19 +5130,19 @@ impl JanitorApp {
                                             Ok(exe) => {
                                                 match schedule::install_daily_task(&exe, &time) {
                                                     Ok(()) => SchedFeedback {
-                                                        status: "✓ 已安装计划任务 DiskJanitorQuietClean".into(),
+                                                        status: "√ 已安装计划任务 DiskJanitorQuietClean".into(),
                                                         installed: None,
                                                         save_config: true,
                                                     },
                                                     Err(e) => SchedFeedback {
-                                                        status: format!("✕ 安装失败：{e}"),
+                                                        status: format!("× 安装失败：{e}"),
                                                         installed: Some(false),
                                                         save_config: false,
                                                     },
                                                 }
                                             }
                                             Err(_) => SchedFeedback {
-                                                status: "✕ 无法确定当前程序路径，未创建计划任务".into(),
+                                                status: "× 无法确定当前程序路径，未创建计划任务".into(),
                                                 installed: Some(false),
                                                 save_config: false,
                                             },
@@ -5150,12 +5151,12 @@ impl JanitorApp {
                                 } else {
                                     self.spawn_schedule(|| match schedule::remove_daily_task() {
                                         Ok(()) => SchedFeedback {
-                                            status: "✓ 已移除计划任务".into(),
+                                            status: "√ 已移除计划任务".into(),
                                             installed: None,
                                             save_config: true,
                                         },
                                         Err(e) => SchedFeedback {
-                                            status: format!("✕ 移除失败：{e}"),
+                                            status: format!("× 移除失败：{e}"),
                                             installed: Some(true),
                                             save_config: false,
                                         },
@@ -5167,7 +5168,7 @@ impl JanitorApp {
                                     Ok(true) => SchedFeedback {
                                         status: match schedule::task_info() {
                                             Ok(info) => format!(
-                                                "✓ 已安装 · 上次 {} · 下次 {} · 退出码 {}",
+                                                "√ 已安装 · 上次 {} · 下次 {} · 退出码 {}",
                                                 info.last_run_time,
                                                 info.next_run_time,
                                                 info.last_task_result
@@ -5185,7 +5186,7 @@ impl JanitorApp {
                                         save_config: false,
                                     },
                                     Err(e) => SchedFeedback {
-                                        status: format!("✕ 状态查询失败：{e}"),
+                                        status: format!("× 状态查询失败：{e}"),
                                         installed: None,
                                         save_config: false,
                                     },
