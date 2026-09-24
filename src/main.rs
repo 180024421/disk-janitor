@@ -1,3 +1,6 @@
+// 发布版是 GUI 程序：不分配控制台窗口（从终端手动调用时 stdout 仍写回原控制台）。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use disk_janitor::{app::JanitorApp, junk, license, trash_ops, updater};
 use eframe::egui;
 use junk::{filter_excluded_paths, junk_selected_paths, safe_junk_hits, scan_junk};

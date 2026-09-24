@@ -1,4 +1,6 @@
 //! 大帅清理器安装程序：解压内嵌 payload.zip → Program Files，写快捷方式与卸载项
+// 发布版双击运行，不弹出控制台窗口。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs::{self, File};
 use std::io::{self, Write};
