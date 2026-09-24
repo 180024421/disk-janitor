@@ -1,6 +1,7 @@
 //! 关于 / 赞助 / 联系（对齐 DeskReader）
 
 use eframe::egui::{self, ColorImage, RichText, TextureHandle};
+use crate::theme;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -112,22 +113,22 @@ pub fn draw_about(
     version_code: u32,
     tip: &mut String,
 ) {
-    ui.horizontal(|ui| {
-        for (p, label) in [
-            (AboutPanel::About, "关于"),
-            (AboutPanel::Sponsor, "赞助"),
-            (AboutPanel::Contact, "联系"),
-        ] {
-            let on = *panel == p;
-            if ui.selectable_label(on, label).clicked() {
-                *panel = p;
-                tip.clear();
-            }
-        }
-    });
+    let idx = match *panel {
+        AboutPanel::About => 0,
+        AboutPanel::Sponsor => 1,
+        AboutPanel::Contact => 2,
+    };
+    if let Some(i) = theme::choice(ui, &["关于", "赞助", "联系"], idx) {
+        *panel = match i {
+            1 => AboutPanel::Sponsor,
+            2 => AboutPanel::Contact,
+            _ => AboutPanel::About,
+        };
+        tip.clear();
+    }
     ui.add_space(8.0);
     if !tip.is_empty() {
-        ui.colored_label(egui::Color32::from_rgb(90, 200, 130), tip.as_str());
+        ui.colored_label(theme::ok(), tip.as_str());
     }
 
     match *panel {
@@ -141,26 +142,26 @@ pub fn draw_about(
             ui.label("· 商业合作请先联系作者取得书面授权");
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("GitHub").clicked() {
+                if theme::ghost_button(ui, "GitHub").clicked() {
                     let _ = open_url(GITHUB_URL);
                 }
-                if ui.button("Gitee").clicked() {
+                if theme::ghost_button(ui, "Gitee").clicked() {
                     let _ = open_url(GITEE_URL);
                 }
-                if ui.button("交流群").clicked() {
+                if theme::ghost_button(ui, "交流群").clicked() {
                     *panel = AboutPanel::Contact;
                 }
-                if ui.button("赞助").clicked() {
+                if theme::ghost_button(ui, "赞助").clicked() {
                     *panel = AboutPanel::Sponsor;
                 }
             });
             ui.add_space(10.0);
-            ui.group(|ui| {
+            theme::card_frame().show(ui, |ui| {
                 ui.strong(format!("交流群 · {QQ_GROUP_NAME}"));
                 ui.horizontal(|ui| {
                     ui.label("QQ群");
                     ui.monospace(QQ_GROUP);
-                    if ui.button("复制").clicked() {
+                    if theme::ghost_button(ui, "复制").clicked() {
                         *tip = match copy_text(QQ_GROUP) {
                             Ok(()) => "已复制群号".into(),
                             Err(e) => e,
@@ -184,12 +185,12 @@ pub fn draw_about(
         }
         AboutPanel::Contact => {
             ui.heading(RichText::new("联系与交流").strong());
-            ui.group(|ui| {
+            theme::card_frame().show(ui, |ui| {
                 ui.strong(format!("交流群 · {QQ_GROUP_NAME}"));
                 ui.label(format!("QQ群 {QQ_GROUP} · 扫码加入"));
                 ui.horizontal(|ui| {
                     ui.monospace(QQ_GROUP);
-                    if ui.button("复制群号").clicked() {
+                    if theme::ghost_button(ui, "复制群号").clicked() {
                         *tip = match copy_text(QQ_GROUP) {
                             Ok(()) => "已复制群号".into(),
                             Err(e) => e,
@@ -201,12 +202,12 @@ pub fn draw_about(
                 }
             });
             ui.add_space(10.0);
-            ui.group(|ui| {
+            theme::card_frame().show(ui, |ui| {
                 ui.strong("作者");
                 ui.horizontal(|ui| {
                     ui.label("QQ");
                     ui.monospace(AUTHOR_QQ);
-                    if ui.button("复制").clicked() {
+                    if theme::ghost_button(ui, "复制").clicked() {
                         *tip = match copy_text(AUTHOR_QQ) {
                             Ok(()) => "已复制 QQ".into(),
                             Err(e) => e,
@@ -216,7 +217,7 @@ pub fn draw_about(
                 ui.horizontal(|ui| {
                     ui.label("邮箱");
                     ui.monospace(AUTHOR_EMAIL);
-                    if ui.button("复制").clicked() {
+                    if theme::ghost_button(ui, "复制").clicked() {
                         *tip = match copy_text(AUTHOR_EMAIL) {
                             Ok(()) => "已复制邮箱".into(),
                             Err(e) => e,
