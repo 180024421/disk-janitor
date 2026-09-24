@@ -33,11 +33,7 @@ pub fn install_daily_task(exe_path: &Path, time_hhmm: &str) -> Result<(), String
     if out.status.success() {
         Ok(())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let out_s = String::from_utf8_lossy(&out.stdout);
-        Err(format!("创建计划任务失败: {} {}", err.trim(), out_s.trim())
-            .trim()
-            .to_string())
+        Err(command_error("创建计划任务失败", &out))
     }
 }
 
@@ -64,25 +60,27 @@ pub fn task_installed() -> bool {
     task_status().unwrap_or(false)
 }
 
-/// 查询任务是否存在；与 `task_installed` 不同，不会把 schtasks 调用失败误报为“未安装”。
+/// 查询任务是否存在。
+///
+/// 不能用 schtasks 的报错文案判断：它按系统 OEM 代码页（中文环境是 GBK）输出，UTF-8 解码
+/// 只剩乱码，于是“找不到任务”会被误判成“查询失败”。注册表 TaskCache\Tree 非管理员也读不了，
+/// 所以走 Get-ScheduledTask 列一遍再比名字，只认 yes / no 这两个 ASCII 字面量。
 pub fn task_status() -> Result<bool, String> {
-    let out = Command::new("schtasks")
-        .args(["/Query", "/TN", TASK_NAME])
-        .output()
-        .map_err(|e| format!("无法调用 schtasks 查询任务：{e}"))?;
-    if out.status.success() {
-        return Ok(true);
-    }
-    let message = format!(
-        "{} {}",
-        String::from_utf8_lossy(&out.stderr),
-        String::from_utf8_lossy(&out.stdout)
+    let script = format!(
+        "if (Get-ScheduledTask | Where-Object {{ $_.TaskName -eq '{}' }}) {{ 'yes' }} else {{ 'no' }}",
+        TASK_NAME
     );
-    if message.contains("cannot find") || message.contains("找不到") || message.contains("不存在")
-    {
-        Ok(false)
-    } else {
-        Err(format!("查询计划任务失败：{}", message.trim()))
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| format!("无法查询计划任务：{e}"))?;
+    if !out.status.success() {
+        return Err(command_error("查询计划任务失败", &out));
+    }
+    match child_text(&out.stdout).as_deref() {
+        Some("yes") => Ok(true),
+        Some("no") => Ok(false),
+        _ => Err("查询计划任务失败：PowerShell 未返回预期结果".into()),
     }
 }
 
@@ -99,7 +97,13 @@ pub fn task_info() -> Result<TaskInfo, String> {
         .output()
         .map_err(|e| format!("无法查询计划任务：{e}"))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err(child_text(&output.stderr)
+            .unwrap_or_else(|| {
+                format!(
+                    "PowerShell 查询计划任务失败，返回退出码 {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            }));
     }
     serde_json::from_slice(&output.stdout).map_err(|e| format!("计划任务状态解析失败：{e}"))
 }
@@ -119,16 +123,44 @@ fn normalize_time(s: &str) -> Result<String, String> {
 }
 
 fn command_error(prefix: &str, out: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    format!("{prefix}：{} {}", stderr.trim(), stdout.trim())
-        .trim()
-        .to_string()
+    let detail = [child_text(&out.stderr), child_text(&out.stdout)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if detail.is_empty() {
+        format!("{prefix}：返回退出码 {}", out.status.code().unwrap_or(-1))
+    } else {
+        format!("{prefix}：{detail}")
+    }
+}
+
+/// 子进程输出：能按 UTF-8 解码才用，GBK 中文提示解码出来是乱码，宁可不显示。
+fn child_text(bytes: &[u8]) -> Option<String> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_error_falls_back_to_exit_code_on_gbk_output() {
+        // “找不到任务” 之类中文提示是 GBK 字节，UTF-8 解不开，不能塞进用户可见文案。
+        let gbk = vec![0xD5, 0xD2, 0xB2, 0xBB, 0xB5, 0xBD];
+        let out = std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: gbk,
+        };
+        let message = command_error("查询计划任务失败", &out);
+        assert!(message.contains("退出码"), "{message}");
+        assert!(!message.contains('\u{FFFD}'), "{message}");
+    }
 
     #[test]
     fn normalizes_time() {
