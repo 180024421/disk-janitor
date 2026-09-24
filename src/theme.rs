@@ -229,10 +229,46 @@ pub fn system_prefers_dark() -> bool {
 }
 
 // ---------- 框架 ----------
-pub fn content_frame() -> Frame {
+/// 把任意语义色压成淡底（徽标/提示条背景），两种模式共用同一入口
+pub fn tint(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// 列表行悬停底：跟随主色蓝，避免另起一套色
+pub fn row_hover() -> Color32 {
+    tint(ACCENT, if dark() { 26 } else { 18 })
+}
+
+// 语义色做正文时对比不够，各模式单独给一档文本色
+pub fn ok_text() -> Color32 {
+    if dark() {
+        Color32::from_rgb(74, 222, 128)
+    } else {
+        Color32::from_rgb(21, 128, 61)
+    }
+}
+
+pub fn warn_text() -> Color32 {
+    if dark() {
+        Color32::from_rgb(251, 191, 36)
+    } else {
+        Color32::from_rgb(180, 83, 9)
+    }
+}
+
+pub fn danger_text() -> Color32 {
+    if dark() {
+        Color32::from_rgb(248, 113, 113)
+    } else {
+        Color32::from_rgb(220, 38, 38)
+    }
+}
+
+/// 页面统一容器：所有 CentralPanel 内容页走这一个边距
+pub fn page_frame() -> Frame {
     Frame::new()
         .fill(background())
-        .inner_margin(Margin::symmetric(24, 18))
+        .inner_margin(Margin::same(16))
 }
 
 pub fn top_bar_frame() -> Frame {
@@ -275,6 +311,14 @@ pub fn table_frame() -> Frame {
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::symmetric(0, 0))
         .stroke(Stroke::new(1.0_f32, line()))
+}
+
+// ---------- 弹窗 ----------
+/// 模态确认框：不可折叠、居中。保留可缩放，长路径预览不能被裁掉。
+pub fn dialog(title: &str) -> egui::Window<'_> {
+    egui::Window::new(title)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
 }
 
 // ---------- 按钮 ----------
@@ -337,6 +381,17 @@ pub fn badge(ui: &mut Ui, text: &str, fg: Color32) {
         .inner_margin(Margin::symmetric(7, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(text).color(fg).size(10.5).strong());
+        });
+}
+
+/// 语义色淡底提示条（授权提示、风险说明等）
+pub fn notice(ui: &mut Ui, color: Color32, text: &str) {
+    Frame::new()
+        .fill(tint(color, 22))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).color(color).size(12.5));
         });
 }
 
@@ -531,11 +586,8 @@ pub fn item_row(
             let rect = ui.max_rect();
             let hovered = ui.rect_contains_pointer(rect);
             if hovered {
-                ui.painter().rect_filled(
-                    rect,
-                    CornerRadius::same(8),
-                    if dark() { ROW_HOVER } else { Color32::from_rgb(249, 250, 251) },
-                );
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::same(8), row_hover());
             }
             ui.add_space(10.0);
             ui.label(RichText::new(icon).size(16.0));

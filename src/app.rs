@@ -591,26 +591,11 @@ impl JanitorApp {
                                     .map(|s| s.valid)
                                     .unwrap_or(false)
                                 {
-                                    OK
+                                    theme::ok_text()
                                 } else {
-                                    WARN
+                                    theme::warn_text()
                                 };
-                                egui::Frame::new()
-                                    .fill(egui::Color32::from_rgba_unmultiplied(
-                                        color.r(),
-                                        color.g(),
-                                        color.b(),
-                                        22,
-                                    ))
-                                    .corner_radius(egui::CornerRadius::same(8))
-                                    .inner_margin(egui::Margin::symmetric(12, 9))
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            egui::RichText::new(tip.clone())
-                                                .color(color)
-                                                .size(12.5),
-                                        );
-                                    });
+                                theme::notice(ui, color, &tip);
                             }
                             if let Some(s) = &self.license_status {
                                 if s.valid {
@@ -3057,7 +3042,7 @@ impl eframe::App for JanitorApp {
                                     && all_groups_confirmed
                                     && !self.dup_scanning
                                     && !self.deleting,
-                                egui::Button::new("删除勾选"),
+                                theme::danger_button("删除勾选"),
                             )
                             .clicked()
                         {
@@ -3129,7 +3114,7 @@ impl eframe::App for JanitorApp {
 impl JanitorApp {
     fn ui_overview(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(theme::content_frame())
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 // 整页纳入滚动区：窗口变矮或内容变长时可以滚动查看，不必把窗口拖大
                 egui::ScrollArea::vertical()
@@ -3528,7 +3513,7 @@ impl JanitorApp {
             });
 
         egui::CentralPanel::default()
-            .frame(theme::content_frame())
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.add(theme::ghost_button("← 上级")).clicked() {
@@ -3630,11 +3615,7 @@ impl JanitorApp {
 
     fn ui_topn(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 if self.index.is_none() {
                     theme::section_title(ui, "最大占用", "请先扫描一个路径");
@@ -3681,11 +3662,7 @@ impl JanitorApp {
 
     fn ui_types(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 theme::section_title(
                     ui,
@@ -3741,11 +3718,7 @@ impl JanitorApp {
 
     fn ui_junk(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
             theme::section_title(
                 ui,
@@ -3900,9 +3873,12 @@ impl JanitorApp {
     }
 
     fn ui_software(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("软件卸载");
-            ui.label(
+        egui::CentralPanel::default()
+            .frame(theme::page_frame())
+            .show(ctx, |ui| {
+            theme::section_title(
+                ui,
+                "软件卸载",
                 "调用官方卸载程序。建议：完成卸载向导后再点「我已卸完再跟扫」，比全盘粗扫准得多。",
             );
             if let Some(hint) = self.awaiting_uninstall_done.clone() {
@@ -4010,13 +3986,13 @@ impl JanitorApp {
                 );
                 ui.checkbox(&mut self.prefer_quiet_uninstall, "优先静默卸载（若有）");
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("刷新列表"))
+                    .add_enabled(!self.busy(), theme::ghost_button("刷新列表"))
                     .clicked()
                 {
                     self.start_software_scan();
                 }
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("刷新 Store 应用"))
+                    .add_enabled(!self.busy(), theme::ghost_button("刷新 Store 应用"))
                     .clicked()
                 {
                     self.start_appx_list();
@@ -4065,17 +4041,17 @@ impl JanitorApp {
                         ui.separator();
                         ui.group(|ui| {
                             ui.colored_label(
-                                WARN,
+                                theme::danger_text(),
                                 "确认卸载此 Store/AppX 应用？此操作不等同于删除普通文件，回收站无法恢复。",
                             );
                             ui.monospace(&full);
                             ui.horizontal(|ui| {
-                                if ui.button("确认卸载").clicked() {
+                                if ui.add(theme::ghost_button("取消")).clicked() {
+                                    self.pending_appx_remove = None;
+                                }
+                                if ui.add(theme::danger_button("确认卸载")).clicked() {
                                     self.pending_appx_remove = None;
                                     self.spawn_appx_remove(full.clone());
-                                }
-                                if ui.button("取消").clicked() {
-                                    self.pending_appx_remove = None;
                                 }
                             });
                         });
@@ -4150,23 +4126,23 @@ impl JanitorApp {
                             }
                             ui.add_space(8.0);
                             {
-                                if ui.button("卸载").clicked() {
+                                if ui.add(theme::link_button("卸载")).clicked() {
                                     to_uninstall = Some(i);
                                 }
                                 if ui
-                                    .add_enabled(!self.busy(), egui::Button::new("查残留"))
+                                    .add_enabled(!self.busy(), theme::link_button("查残留"))
                                     .clicked()
                                 {
                                     to_follow = Some(i);
                                 }
                                 if ui
-                                    .add_enabled(!self.busy(), egui::Button::new("查占用进程"))
+                                    .add_enabled(!self.busy(), theme::link_button("查占用进程"))
                                     .clicked()
                                 {
                                     to_lock = Some(i);
                                 }
                                 if ui
-                                    .add_enabled(!self.busy(), egui::Button::new("查服务/任务"))
+                                    .add_enabled(!self.busy(), theme::link_button("查服务/任务"))
                                     .clicked()
                                 {
                                     to_svc = Some(i);
@@ -4296,9 +4272,12 @@ impl JanitorApp {
     }
 
     fn ui_startup(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("开机自启");
-            ui.label(
+        egui::CentralPanel::default()
+            .frame(theme::page_frame())
+            .show(ctx, |ui| {
+            theme::section_title(
+                ui,
+                "开机自启",
                 "识别注册表 Run 与启动文件夹项，说明用途并给出安全建议。禁用可恢复；删除不可恢复（快捷方式进回收站）。",
             );
             ui.colored_label(
@@ -4313,7 +4292,7 @@ impl JanitorApp {
                         .hint_text("名称 / 命令"),
                 );
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("刷新"))
+                    .add_enabled(!self.busy(), theme::ghost_button("刷新"))
                     .clicked()
                 {
                     self.start_startup_scan();
@@ -4380,9 +4359,9 @@ impl JanitorApp {
                     ui.group(|ui| {
                         ui.horizontal_wrapped(|ui| {
                             if item.enabled {
-                                ui.colored_label(egui::Color32::from_rgb(40, 140, 70), "启用");
+                                ui.colored_label(theme::ok_text(), "启用");
                             } else {
-                                ui.colored_label(egui::Color32::from_rgb(140, 100, 40), "已禁用");
+                                ui.colored_label(theme::warn_text(), "已禁用");
                             }
                             ui.strong(&item.name);
                             let (advice_color, advice_text) = match item.advice {
@@ -4470,11 +4449,7 @@ impl JanitorApp {
 
     fn ui_shortcuts(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 theme::section_title(
                     ui,
@@ -4524,7 +4499,7 @@ impl JanitorApp {
                             ui.weak(format!("位置: {}", s.location));
                             ui.monospace(s.path.display().to_string());
                             ui.colored_label(
-                                egui::Color32::from_rgb(180, 90, 60),
+                                theme::warn_text(),
                                 format!("目标不存在: {}", s.target),
                             );
                         });
@@ -4535,11 +4510,7 @@ impl JanitorApp {
 
     fn ui_registry(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 theme::section_title(
                     ui,
@@ -4582,7 +4553,7 @@ impl JanitorApp {
                                 ui.strong(&o.display_name);
                                 ui.label(o.hive);
                             });
-                            ui.colored_label(egui::Color32::from_rgb(180, 90, 60), &o.reason);
+                            ui.colored_label(theme::warn_text(), &o.reason);
                             ui.monospace(&o.full_path);
                         });
                     }
@@ -4592,11 +4563,7 @@ impl JanitorApp {
 
     fn ui_duplicates(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 theme::section_title(
                     ui,
@@ -4714,11 +4681,7 @@ impl JanitorApp {
 
     fn ui_tools(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(16)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     theme::section_title(ui, "工具箱", "导出、对比、残留、回收站与提权。");
@@ -5009,11 +4972,7 @@ impl JanitorApp {
 
     fn ui_settings(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(18)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     theme::section_title(
@@ -5451,11 +5410,7 @@ impl JanitorApp {
 
     fn ui_about(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::background())
-                    .inner_margin(egui::Margin::same(18)),
-            )
+            .frame(theme::page_frame())
             .show(ctx, |ui| {
                 if self.about_assets.is_none() {
                     self.about_assets = Some(AboutAssets::load(ctx));
@@ -5505,7 +5460,7 @@ impl JanitorApp {
         theme::table_frame().show(ui, |ui| {
             // 表头
             egui::Frame::new()
-                .fill(Color32::from_rgb(22, 32, 48))
+                .fill(theme::row_alt())
                 .inner_margin(egui::Margin::symmetric(12, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -5640,7 +5595,7 @@ impl JanitorApp {
                             ui.painter().rect_filled(
                                 row.response.rect,
                                 egui::CornerRadius::ZERO,
-                                Color32::from_rgba_unmultiplied(45, 168, 196, 18),
+                                theme::row_hover(),
                             );
                         }
                         theme::hairline(ui);
@@ -5675,61 +5630,55 @@ impl JanitorApp {
 
     fn ui_dialogs(&mut self, ctx: &egui::Context) {
         if self.confirm_sensitive {
-            egui::Window::new("系统路径警告")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("选中项包含敏感系统路径，确定仍要移到回收站？");
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_sensitive = false;
-                        }
-                        if ui.button("仍然删除").clicked() {
-                            self.confirm_sensitive = false;
-                            self.confirm_delete = true;
-                        }
-                    });
+            theme::dialog("系统路径警告").show(ctx, |ui| {
+                ui.label("选中项包含敏感系统路径，确定仍要移到回收站？");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_sensitive = false;
+                    }
+                    if ui.add(theme::danger_button("仍然删除")).clicked() {
+                        self.confirm_sensitive = false;
+                        self.confirm_delete = true;
+                    }
                 });
+            });
         }
         if self.confirm_delete {
             let paths = self.selected_paths();
             let n = paths.len();
             let sz = format_bytes(self.selected_total_size());
             let preview = paths_ui::preview_paths(&paths, 12);
-            egui::Window::new("确认删除")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("将删除 {n} 项（合计 {sz}）。"));
-                    ui.label("优先进回收站。结果会写在底部「操作日志」。");
-                    ui.group(|ui| {
-                        ui.weak("将删除：");
-                        ui.monospace(&preview);
-                    });
-                    ui.checkbox(&mut self.allow_permanent_delete, "回收站失败时允许直接删除");
-                    if ui
-                        .checkbox(&mut self.shred_delete, "安全粉碎（仅文件，不可进回收站）")
-                        .changed()
-                        && self.shred_delete
-                    {
-                        self.allow_permanent_delete = true;
-                    }
-                    if self.shred_delete {
-                        ui.colored_label(
-                            DANGER,
-                            "粉碎将覆写后永久删除；SSD 因磨损均衡不保证数据不可恢复。",
-                        );
-                    }
-                    ui.weak("提示：WSL 的 ext4.vhdx 若占用，请先在终端执行 wsl --shutdown");
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_delete = false;
-                        }
-                        if ui.button("开始删除").clicked() {
-                            self.do_delete();
-                        }
-                    });
+            theme::dialog("确认删除").show(ctx, |ui| {
+                ui.label(format!("将删除 {n} 项（合计 {sz}）。"));
+                ui.label("优先进回收站。结果会写在底部「操作日志」。");
+                ui.group(|ui| {
+                    ui.weak("将删除：");
+                    ui.monospace(&preview);
                 });
+                ui.checkbox(&mut self.allow_permanent_delete, "回收站失败时允许直接删除");
+                if ui
+                    .checkbox(&mut self.shred_delete, "安全粉碎（仅文件，不可进回收站）")
+                    .changed()
+                    && self.shred_delete
+                {
+                    self.allow_permanent_delete = true;
+                }
+                if self.shred_delete {
+                    ui.colored_label(
+                        theme::danger_text(),
+                        "粉碎将覆写后永久删除；SSD 因磨损均衡不保证数据不可恢复。",
+                    );
+                }
+                ui.weak("提示：WSL 的 ext4.vhdx 若占用，请先在终端执行 wsl --shutdown");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_delete = false;
+                    }
+                    if ui.add(theme::danger_button("开始删除")).clicked() {
+                        self.do_delete();
+                    }
+                });
+            });
         }
         if self.confirm_junk || self.confirm_safe_clean {
             // 打开期间只算一次（canonicalize 可能较慢），选择变化时在开框处清缓存
@@ -5755,44 +5704,38 @@ impl JanitorApp {
             } else {
                 "确认清理垃圾"
             };
-            egui::Window::new(title)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    if self.confirm_safe_clean {
-                        ui.label("仅清理非敏感默认安全项（Temp / 浏览器缓存 / 缩略图等）。");
-                    }
-                    ui.label(format!(
-                        "将清理 {} 个位置（约 {}）。目录只清内容，不删根文件夹。",
-                        paths.len(),
-                        format_bytes(sz)
-                    ));
-                    ui.label("优先进回收站；正在使用的文件会跳过。");
-                    ui.checkbox(
-                        &mut self.junk_allow_permanent,
-                        "回收站放不进去时允许直接删除（不可恢复）",
-                    );
-                    ui.group(|ui| {
-                        ui.weak("将清理：");
-                        ui.monospace(&preview);
-                    });
-                    if sensitive {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(200, 80, 60),
-                            "含系统敏感路径，请确认。",
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_junk = false;
-                            self.confirm_safe_clean = false;
-                            self.junk_confirm_paths = None;
-                        }
-                        if ui.button("开始清理").clicked() {
-                            self.do_junk_clean();
-                        }
-                    });
+            theme::dialog(title).show(ctx, |ui| {
+                if self.confirm_safe_clean {
+                    ui.label("仅清理非敏感默认安全项（Temp / 浏览器缓存 / 缩略图等）。");
+                }
+                ui.label(format!(
+                    "将清理 {} 个位置（约 {}）。目录只清内容，不删根文件夹。",
+                    paths.len(),
+                    format_bytes(sz)
+                ));
+                ui.label("优先进回收站；正在使用的文件会跳过。");
+                ui.checkbox(
+                    &mut self.junk_allow_permanent,
+                    "回收站放不进去时允许直接删除（不可恢复）",
+                );
+                ui.group(|ui| {
+                    ui.weak("将清理：");
+                    ui.monospace(&preview);
                 });
+                if sensitive {
+                    ui.colored_label(theme::danger_text(), "含系统敏感路径，请确认。");
+                }
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_junk = false;
+                        self.confirm_safe_clean = false;
+                        self.junk_confirm_paths = None;
+                    }
+                    if ui.add(theme::accent_button("开始清理")).clicked() {
+                        self.do_junk_clean();
+                    }
+                });
+            });
         }
         if self.confirm_shortcuts {
             let paths: Vec<PathBuf> = self
@@ -5803,45 +5746,39 @@ impl JanitorApp {
                 .collect();
             let n = paths.len();
             let preview = paths_ui::preview_paths(&paths, 12);
-            egui::Window::new("确认删除失效快捷方式")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("将把 {n} 个失效 .lnk 移到回收站。"));
-                    ui.group(|ui| {
-                        ui.weak("将删除：");
-                        ui.monospace(&preview);
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_shortcuts = false;
-                        }
-                        if ui.button("移到回收站").clicked() {
-                            self.do_shortcuts_clean();
-                        }
-                    });
+            theme::dialog("确认删除失效快捷方式").show(ctx, |ui| {
+                ui.label(format!("将把 {n} 个失效 .lnk 移到回收站。"));
+                ui.group(|ui| {
+                    ui.weak("将删除：");
+                    ui.monospace(&preview);
                 });
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_shortcuts = false;
+                    }
+                    if ui.add(theme::accent_button("移到回收站")).clicked() {
+                        self.do_shortcuts_clean();
+                    }
+                });
+            });
         }
         if self.confirm_orphans {
             let n = self.orphans.iter().filter(|o| o.selected).count();
-            egui::Window::new("确认删除注册表项")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 80, 60),
-                        format!("将永久删除 {n} 个 Uninstall 注册表子键（不可进回收站）。"),
-                    );
-                    ui.label("仅限判定为无效的卸载项；HKLM 需要管理员权限。");
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_orphans = false;
-                        }
-                        if ui.button("删除注册表项").clicked() {
-                            self.do_orphans_clean();
-                        }
-                    });
+            theme::dialog("确认删除注册表项").show(ctx, |ui| {
+                ui.colored_label(
+                    theme::danger_text(),
+                    format!("将永久删除 {n} 个 Uninstall 注册表子键（不可进回收站）。"),
+                );
+                ui.label("仅限判定为无效的卸载项；HKLM 需要管理员权限。");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_orphans = false;
+                    }
+                    if ui.add(theme::danger_button("删除注册表项")).clicked() {
+                        self.do_orphans_clean();
+                    }
                 });
+            });
         }
         if self.confirm_dup_delete {
             let mut paths = Vec::new();
@@ -5854,25 +5791,22 @@ impl JanitorApp {
             }
             let n = paths.len();
             let preview = paths_ui::preview_paths(&paths, 12);
-            egui::Window::new("确认删除重复文件")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(format!("将删除 {n} 个勾选的重复文件（优先进回收站）。"));
-                    ui.group(|ui| {
-                        ui.weak("将删除：");
-                        ui.monospace(&preview);
-                    });
-                    ui.checkbox(&mut self.allow_permanent_delete, "回收站失败时允许直接删除");
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_dup_delete = false;
-                        }
-                        if ui.button("开始删除").clicked() {
-                            self.do_dup_delete();
-                        }
-                    });
+            theme::dialog("确认删除重复文件").show(ctx, |ui| {
+                ui.label(format!("将删除 {n} 个勾选的重复文件（优先进回收站）。"));
+                ui.group(|ui| {
+                    ui.weak("将删除：");
+                    ui.monospace(&preview);
                 });
+                ui.checkbox(&mut self.allow_permanent_delete, "回收站失败时允许直接删除");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_dup_delete = false;
+                    }
+                    if ui.add(theme::danger_button("开始删除")).clicked() {
+                        self.do_dup_delete();
+                    }
+                });
+            });
         }
         if self.confirm_leftovers {
             let paths: Vec<PathBuf> = self
@@ -5883,64 +5817,52 @@ impl JanitorApp {
                 .collect();
             let n = paths.len();
             let preview = paths_ui::preview_paths(&paths, 12);
-            egui::Window::new("确认删除卸载残留")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 80, 60),
-                        format!("将删除 {n} 个残留目录（请确认不是仍在用的软件）。"),
-                    );
-                    ui.group(|ui| {
-                        ui.weak("将删除：");
-                        ui.monospace(&preview);
-                    });
-                    ui.checkbox(&mut self.allow_permanent_delete, "回收站失败时允许直接删除");
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_leftovers = false;
-                        }
-                        if ui.button("开始删除").clicked() {
-                            self.do_leftovers_delete();
-                        }
-                    });
+            theme::dialog("确认删除卸载残留").show(ctx, |ui| {
+                ui.colored_label(
+                    theme::danger_text(),
+                    format!("将删除 {n} 个残留目录（请确认不是仍在用的软件）。"),
+                );
+                ui.group(|ui| {
+                    ui.weak("将删除：");
+                    ui.monospace(&preview);
                 });
+                ui.checkbox(&mut self.allow_permanent_delete, "回收站失败时允许直接删除");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_leftovers = false;
+                    }
+                    if ui.add(theme::danger_button("开始删除")).clicked() {
+                        self.do_leftovers_delete();
+                    }
+                });
+            });
         }
         if self.confirm_empty_recycle {
-            egui::Window::new("确认清空回收站")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 80, 60),
-                        "将永久清空回收站，无法恢复。",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("取消").clicked() {
-                            self.confirm_empty_recycle = false;
-                        }
-                        if ui.button("清空回收站").clicked() {
-                            self.do_empty_recycle();
-                        }
-                    });
+            theme::dialog("确认清空回收站").show(ctx, |ui| {
+                ui.colored_label(theme::danger_text(), "将永久清空回收站，无法恢复。");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("取消")).clicked() {
+                        self.confirm_empty_recycle = false;
+                    }
+                    if ui.add(theme::danger_button("清空回收站")).clicked() {
+                        self.do_empty_recycle();
+                    }
                 });
+            });
         }
         if self.show_recycle_hint {
-            egui::Window::new("已移入回收站")
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label("已移入回收站。可在回收站还原。");
-                    ui.horizontal(|ui| {
-                        if ui.button("打开回收站").clicked() {
-                            let _ = paths_ui::open_recycle_bin();
-                            self.show_recycle_hint = false;
-                        }
-                        if ui.button("知道了").clicked() {
-                            self.show_recycle_hint = false;
-                        }
-                    });
+            theme::dialog("已移入回收站").show(ctx, |ui| {
+                ui.label("已移入回收站。可在回收站还原。");
+                ui.horizontal(|ui| {
+                    if ui.add(theme::ghost_button("打开回收站")).clicked() {
+                        let _ = paths_ui::open_recycle_bin();
+                        self.show_recycle_hint = false;
+                    }
+                    if ui.add(theme::accent_button("知道了")).clicked() {
+                        self.show_recycle_hint = false;
+                    }
                 });
+            });
         }
     }
 }
